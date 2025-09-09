@@ -17,7 +17,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 
-from examples.drone.navragation.nav_env import NavEnv
+from track_env import TrackerEnv
 
 
 def get_train_cfg(exp_name, max_iterations):
@@ -89,22 +89,32 @@ def get_cfgs():
         "visualize_camera": False,
         "max_visualize_FPS": 60,
     }
+
     obs_cfg = {
-        "num_obs": 17,
+        "num_obs": 14,
         "obs_scales": {
             "rel_pos": 1 / 3.0,
             "lin_vel": 1 / 3.0,
             "ang_vel": 1 / 3.14159,
         },
     }
+    # reward_cfg = {
+    #     "yaw_lambda": -10.0,
+    #     "reward_scales": {
+    #         "target": 10.0,
+    #         "smooth": -1e-4,
+    #         "yaw": 0.01,
+    #         "angular": -2e-4,
+    #         "crash": -10.0,
+    #     },
+    # }
     reward_cfg = {
         "yaw_lambda": -10.0,
         "reward_scales": {
-            "target": 10.0,
+            "distance": -1.0,
             "smooth": -1e-4,
-            "yaw": 0.01,
-            "angular": -2e-4,
-            "crash": -10.0,
+            # "angular": -2e-4,
+            "crash": -1.0,
         },
     }
     command_cfg = {
@@ -143,7 +153,7 @@ def main():
         open(f"{log_dir}/cfgs.pkl", "wb"),
     )
 
-    env = NavEnv(
+    env = TrackerEnv(
         num_envs=args.num_envs,
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,
