@@ -55,11 +55,13 @@ def easy_fly(drone: DroneEntity, scene: gs.Scene):
 
     # 1. 总推力需求
     acc_des = [0.0, 0.0, 0.0]  # 悬停不加速
-    ang_acc_des = [0.0, 0.0, 1.0]  # 不转动
+    ang_acc_des = [0.0, 0.0, 0.0]  # 不转动
     mass = drone.get_mass()
     g = 9.81
     KF = drone._KF
     KM = drone._KM
+    _propellers_spin = drone._propellers_spin
+    
     l = 0.12     # m
     step = 0
     while step < 1000:
