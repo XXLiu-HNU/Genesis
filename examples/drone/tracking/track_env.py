@@ -2,6 +2,7 @@ import torch
 import math
 import copy
 import genesis as gs
+from quadcopter_controller import DronePIDController
 from genesis.utils.geom import (
     quat_to_xyz,
     transform_by_quat,
@@ -23,8 +24,8 @@ class TrackerEnv:
         self.num_actions = env_cfg["num_actions"]
         self.num_commands = command_cfg["num_commands"]
         self.device = gs.device
-        self.od_min_sq = 1.0
-        self.od_max_sq = 3.0
+        self.od_min_sq = 1.0*1.0
+        self.od_max_sq = 3.0*3.0
 
         self.simulate_action_latency = env_cfg["simulate_action_latency"]
         self.dt = 0.01  # run in 100hz
@@ -98,7 +99,7 @@ class TrackerEnv:
         self.target_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
         self.target_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.target_inv_init_quat = inv_quat(self.target_init_quat)
-        self.target = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf",pos = (1.0,0.0,0.0)))
+        self.target = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
         
         # build scene
         self.scene.build(n_envs=num_envs)
@@ -115,7 +116,6 @@ class TrackerEnv:
         self.rew_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
-        self.commands = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)
 
         self.actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
         self.last_actions = torch.zeros_like(self.actions)
@@ -135,10 +135,22 @@ class TrackerEnv:
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
 
-    def _resample_commands(self, envs_idx):
-        self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(envs_idx),), gs.device)
-        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(envs_idx),), gs.device)
-        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["pos_z_range"], (len(envs_idx),), gs.device)
+        pid_params = [
+        [2.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [20.0, 0.0, 20.0],
+        [20.0, 0.0, 20.0],
+        [25.0, 0.0, 20.0],
+        [10.0, 0.0, 1.0],
+        [10.0, 0.0, 1.0],
+        [2.0, 0.0, 0.2],
+        ]
+
+        base_rpm = 14468.429183500699
+        self.tracker_controller = DronePIDController(drone=self.tracker, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
+        self.target_controller = DronePIDController(drone=self.target, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
+
 
     def _collision_detect(self):
         # TODO 
@@ -156,21 +168,19 @@ class TrackerEnv:
         )
 
     def step(self, actions):
+        
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         exec_actions = self.actions
 
+        prop_rpms = self.tracker_controller.update(self.actions)   # [N,4] tensor
+        self.tracker.set_propellels_rpm(prop_rpms)                  # 假设 set_propellels_rpm 支持 batched tensor
+
+        hover_rpm = torch.ones(
+            (self.num_envs, 4), device=self.device
+        ) * 62293.9641914 # 59489.68 for cf2x, 39777.86 for our drone
+        self.target.set_propellels_rpm(hover_rpm)
+
         # 14468 is hover rpm
-        # TODO 这里需要使用一个具体的控制器来控制无人机
-        self.tracker.set_propellels_rpm((1 + exec_actions * 0.8) * 14468.429183500699)
-
-        #  TODO 同时需要控制 target
-        target_action = torch.zeros_like(exec_actions)
-        self.target.set_propellels_rpm(14468.429183500699 * torch.ones((self.num_envs, 4), device=gs.device))
-
-        # update target pos
-        # 这里可能就不需要了
-        # if self.target is not None:
-        #     self.target.set_pos(self.commands, zero_velocity=True)
 
         self.scene.step()
 
@@ -185,8 +195,6 @@ class TrackerEnv:
 
         self.rel_pos = self.target_pos - self.tracker_pos
 
-        # 这里是为了计算相对位置，这里不需要了
-        # self.last_rel_pos = self.commands - self.last_base_pos
         self.tracker_quat[:] = self.tracker.get_quat()
         self.tracker_euler = quat_to_xyz(
             transform_quat_by_quat(
@@ -213,11 +221,6 @@ class TrackerEnv:
         self.target_lin_vel[:] = transform_by_quat(self.target.get_vel(), inv_target_quat)
         self.target_ang_vel[:] = transform_by_quat(self.target.get_ang(), inv_target_quat)
 
-        # resample commands
-        # 这里是为了在到达目标点之后重新采样一个目标点，这里不需要了
-        # envs_idx = self._at_target()
-        # self._resample_commands(envs_idx)
-
         # check termination and reset
         # 判断终止条件
         # 1. 无人机发生碰撞
@@ -232,7 +235,11 @@ class TrackerEnv:
                                 | (torch.abs(self.tracker_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
                                 | (torch.abs(self.tracker_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
                                 | (self.tracker_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
+                                | (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
+                                | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
+                                | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
                                 )
+        # print("crash_condition shape:", self.crash_condition.shape)
 
         # self.crash_condition = (
         #     (torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
@@ -257,7 +264,7 @@ class TrackerEnv:
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
-            print(f"{name} reward: {rew.mean().item():.3f}")
+            # print(f"{name} reward: {rew.mean().item():.3f}")
 
         # compute observations
         self.obs_buf = torch.cat(
@@ -273,25 +280,6 @@ class TrackerEnv:
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
 
-        for name, x in [("rel_pos", self.rel_pos), 
-                ("tracker_quat", self.tracker_quat),
-                ("target_lin_vel", self.target_lin_vel),
-                ("last_actions", self.last_actions)]:
-            if torch.isnan(x).any() or torch.isinf(x).any():
-                print(f"{name} contains NaN/Inf:", x)
-
-        def check_tensor(x, name="tensor"):
-            if isinstance(x, torch.Tensor):
-                if not torch.isfinite(x).all():
-                    raise RuntimeError(f"{name} contains non-finite values: min={x.min().item()}, max={x.max().item()}, any_nan={torch.isnan(x).any().item()}")
-                # 记录一下范围便于调试
-                if x.abs().max().item() > 1e3:
-                    print(f"WARNING {name} has large magnitude: max_abs={x.abs().max().item()}")
-        # print(f"reward is {self.rew_buf.abs().max().item()}")
-        # 使用示例
-        check_tensor(self.obs_buf, "obs_buf")
-        check_tensor(self.rew_buf, "reward")
-
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
@@ -304,7 +292,6 @@ class TrackerEnv:
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
             return
-
         # reset tracker base
         self.tracker_pos[envs_idx] = self.tracker_init_pos
         self.tracker_last_pos[envs_idx] = self.tracker_init_pos
@@ -316,7 +303,7 @@ class TrackerEnv:
         self.tracker.zero_all_dofs_velocity(envs_idx)
 
         # reset target base
-        self.tracker_pos[envs_idx] = self.target_init_pos + torch.tensor([1.0, 0.0, 0.0], device=gs.device)
+        self.target_pos[envs_idx] = self.target_init_pos + torch.tensor([1.0, 0.0, 0.0], device=gs.device)
         self.target_last_pos[envs_idx] = self.target_init_pos
         self.target_quat[envs_idx] = self.target_init_quat.reshape(1, -1)
         self.target.set_pos(self.target_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
@@ -325,8 +312,7 @@ class TrackerEnv:
         self.target_ang_vel[envs_idx] = 0
         self.target.zero_all_dofs_velocity(envs_idx)
 
-        self.rel_pos = self.tracker_pos - self.tracker_pos
-        # self.last_rel_pos = self.commands - self.last_base_pos
+        self.rel_pos = self.target_pos - self.tracker_pos
 
 
         # reset buffers
@@ -341,8 +327,6 @@ class TrackerEnv:
                 torch.mean(self.episode_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
             )
             self.episode_sums[key][envs_idx] = 0.0
-
-        self._resample_commands(envs_idx)
 
     def reset(self):
         self.reset_buf[:] = True
@@ -373,22 +357,53 @@ class TrackerEnv:
         crash_rew[self.crash_condition] = 1
         return crash_rew
     
-    def _reward_distance(self):
-        # 距离平方
-        dist_sq = torch.sum(torch.square(self.rel_pos), dim=1)
-
-        # 限制在合理范围，避免立方爆炸
-        dist_sq = torch.clamp(dist_sq, min=0.0, max=10.0)  # 100 只是例子，你可以调
-
-        # 定义惩罚函数 g(x) = max(0, x)^3
-        def g(x):
-            return torch.clamp(x, min=0.0)
-
-        penalty = g(self.od_min_sq - dist_sq) + g(dist_sq - self.od_max_sq)
-
-        reward = -penalty  # 不要再 sum 了，直接保持 [num_envs] 维度即可
-
-        # 最终再限幅
-        reward = torch.clamp(reward, min=-100.0, max=0.0)
-
+    def _reward_distance_horizontal(self):
+        # 计算水平距离的平方
+        horizontal_dist_sq = torch.sum(torch.square(self.rel_pos[:, :2]), dim=1)
+        
+        # 限制在合理范围，避免数值爆炸
+        horizontal_dist_sq = torch.clamp(horizontal_dist_sq, min=0.0, max=25.0)
+        
+        # 创建掩码：判断距离是否在[od_min_sq, od_max_sq]范围内
+        in_range = (horizontal_dist_sq >= self.od_min_sq) & (horizontal_dist_sq <= self.od_max_sq)
+        
+        # 对于超出范围的部分计算惩罚
+        # 小于最小值的惩罚
+        penalty_below = torch.clamp(self.od_min_sq - horizontal_dist_sq, min=0.0)** 2
+        # 大于最大值的惩罚
+        penalty_above = torch.clamp(horizontal_dist_sq - self.od_max_sq, min=0.0)**2
+        
+        # 总惩罚（只对超出范围的部分）
+        total_penalty = penalty_below + penalty_above
+        
+        # 初始化奖励：范围内的给予固定奖励，范围外的为负惩罚
+        reward = torch.where(in_range, 
+                            torch.tensor(1.0, device=horizontal_dist_sq.device),  # 固定奖励值
+                            -total_penalty)  # 范围外的惩罚
+        
+        # 最终限幅，确保奖励在合理区间
+        reward = torch.clamp(reward, min=-100.0, max=1.0)  # 最大值调整为固定奖励值
+        
+        return reward
+    
+    def _reward_distance_vertical(self):
+        # 获取垂直方向的距离（取绝对值）
+        vertical_dist = torch.abs(self.rel_pos[:, 2])
+        
+        # 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
+        # sigma控制奖励随距离衰减的速度，可以根据实际需求调整
+        sigma = 2.0
+        reward = torch.exp(-0.5 * (vertical_dist / sigma)**2)
+        
+        # 对于过大的垂直距离添加额外惩罚
+        max_allowed_dist = 1.5  # 最大允许的垂直距离
+        penalty = torch.clamp(vertical_dist - max_allowed_dist, min=0.0)**2
+        penalty_scale = 0.1  # 惩罚系数
+        
+        # 将惩罚项加入到最终奖励中
+        reward = reward - penalty_scale * penalty
+    
+        # 限制奖励范围
+        reward = torch.clamp(reward, min=-2.0, max=1.0)
+        
         return reward

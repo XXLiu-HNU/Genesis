@@ -6920,6 +6920,9 @@ def kernel_set_drone_rpm(
     Set the RPM of propellers of a drone entity.
 
     This method should only be called by drone entities.
+
+    通过KF 和KM将RPM转换为力和力矩，然后施加到对应的link上。
+    因此控制器可能需要根据KF和KM来计算所需的RPM。
     """
     _B = propellers_rpm.shape[1]
     for i_b in range(_B):

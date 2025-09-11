@@ -18,7 +18,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 
-from examples.drone.navragation.nav_env import NavEnv
+from track_env import TrackerEnv
 
 
 def main():
@@ -41,7 +41,7 @@ def main():
     # set the max FPS for visualization
     env_cfg["max_visualize_FPS"] = 60
 
-    env = NavEnv(
+    env = TrackerEnv(
         num_envs=1,
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,

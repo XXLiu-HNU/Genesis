@@ -1,8 +1,3 @@
-import genesis as gs
-from genesis.engine.entities.drone_entity import DroneEntity
-
-import numpy as np
-
 import numpy as np
 
 def quad_mixer(acc_des, ang_acc_des, mass, g, l, KF, KM):
@@ -48,53 +43,16 @@ def quad_mixer(acc_des, ang_acc_des, mass, g, l, KF, KM):
     return omegas
 
 
-def easy_fly(drone: DroneEntity, scene: gs.Scene):
-    """
-
-    """
-
-    # 1. 总推力需求
-    acc_des = [0.0, 0.0, 0.0]  # 悬停不加速
-    ang_acc_des = [0.0, 0.0, 1.0]  # 不转动
-    mass = drone.get_mass()
-    g = 9.81
-    KF = drone._KF
-    KM = drone._KM
-    l = 0.12     # m
-    step = 0
-    while step < 1000:
-        omegas = quad_mixer(acc_des, ang_acc_des, mass, g, l, KF, KM)
-        M1, M2, M3, M4 = omegas
-        
-        drone.set_propellels_rpm([M1, M2, M3, M4])
-        scene.step()
-        
-        step += 1
-
-
-def main():
-    gs.init(backend=gs.gpu)
-
-    ##### scene #####
-    scene = gs.Scene(show_viewer=True, sim_options=gs.options.SimOptions(dt=0.01))
-    ##### entities #####
-    plane = scene.add_entity(morph=gs.morphs.Plane())
-
-    drone = scene.add_entity(morph=gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf", pos=(0, 0, 0.2)))
-
-    cam = scene.add_camera(pos=(1, 1, 1), GUI=False, res=(640, 480), fov=30)
-
-    ##### build #####
-
-    scene.build()
-    cam.start_recording()
-
-    points = [(1, 1, 2), (-1, 2, 1), (0, 0, 0.5)]
-
-    for point in points:
-        
-        easy_fly(drone, scene)
-
-
 if __name__ == "__main__":
-    main()
+    mass = 1.0   # kg
+    g = 9.81     # m/s^2
+    l = 0.25     # m
+    KF = 3e-6    # N/(rad/s)^2
+    KM = 1e-7    # Nm/(rad/s)^2
+
+    # 目标: 悬停 (只需要抵消重力)，无角加速度
+    acc_des = np.array([0.0, 0.0, 0.0])      # 悬停不加速
+    ang_acc_des = np.array([0.0, 0.0, 0.0])  # 不转动
+
+    omegas = quad_mixer(acc_des, ang_acc_des, mass, g, l, KF, KM)
+    print("螺旋桨角速度:", omegas)

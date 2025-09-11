@@ -68,14 +68,14 @@ def get_train_cfg(exp_name, max_iterations):
 
 def get_cfgs():
     env_cfg = {
-        "num_actions": 4,
+        "num_actions": 3,
         # termination
-        "termination_if_roll_greater_than": 180,  # degree
-        "termination_if_pitch_greater_than": 180,
+        "termination_if_roll_greater_than": 90,  # degree
+        "termination_if_pitch_greater_than": 90,
         "termination_if_close_to_ground": 0.1,
-        "termination_if_x_greater_than": 3.0,
-        "termination_if_y_greater_than": 3.0,
-        "termination_if_z_greater_than": 2.0,
+        "termination_if_x_greater_than": 10.0,
+        "termination_if_y_greater_than": 10.0,
+        "termination_if_z_greater_than": 2.5,
         # base pose
         "base_init_pos": [0.0, 0.0, 1.0],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
@@ -91,7 +91,7 @@ def get_cfgs():
     }
 
     obs_cfg = {
-        "num_obs": 14,
+        "num_obs": 13,
         "obs_scales": {
             "rel_pos": 1 / 3.0,
             "lin_vel": 1 / 3.0,
@@ -111,8 +111,9 @@ def get_cfgs():
     reward_cfg = {
         "yaw_lambda": -10.0,
         "reward_scales": {
-            "distance": -1.0,
-            "smooth": -1e-4,
+            "distance_horizontal": 1e-2,
+            "distance_vertical": 1e-2,
+            # "smooth": -1e-4,
             # "angular": -2e-4,
             "crash": -1.0,
         },
