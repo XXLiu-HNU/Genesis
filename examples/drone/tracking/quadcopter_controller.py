@@ -125,43 +125,34 @@ class DronePIDController:
         self.pid_att_pitch.reset_idx(env_idx)
         self.pid_att_yaw.reset_idx(env_idx)
 
-    def update(self, targets):
+    def update(self, vel_targets):
         """
-        targets: [N,3] desired positions (or commands)
-        returns: rpms: [N,4] torch tensor on gs.device
+        vel_targets: [N,3] 期望速度 (vx, vy, vz)
+        returns: rpms: [N,4]
         """
-        # ensure tensor on right device/dtype
-        targets = targets.to(self.device).to(self.dtype)
+        vel_targets = vel_targets.to(self.device).to(self.dtype)  # [N,3]
 
-        curr_pos = self._get_pos()        # [N,3]
-        curr_vel = self._get_vel()        # [N,3]
-        curr_att = self._get_att()        # [N,3] roll,pitch,yaw (deg)
-
-        # --- position loop ---
-        err_pos = targets - curr_pos      # [N,3]
-        vel_des_x = self.pid_pos_x.update(err_pos[:, 0], self.dt)  # [N]
-        vel_des_y = self.pid_pos_y.update(err_pos[:, 1], self.dt)
-        vel_des_z = self.pid_pos_z.update(err_pos[:, 2], self.dt)
+        curr_vel = self._get_vel()   # [N,3]
+        curr_att = self._get_att()   # [N,3] roll,pitch,yaw (deg)
 
         # --- velocity loop ---
-        # err_vel  = targets - curr_vel      # [N,3]
-        err_vel_x = vel_des_x - curr_vel[:, 0]
-        err_vel_y = vel_des_y - curr_vel[:, 1]
-        err_vel_z = vel_des_z - curr_vel[:, 2]
+        err_vel_x = vel_targets[:, 0] - curr_vel[:, 0]
+        err_vel_y = vel_targets[:, 1] - curr_vel[:, 1]
+        err_vel_z = vel_targets[:, 2] - curr_vel[:, 2]
 
         x_vel_del = self.pid_vel_x.update(err_vel_x, self.dt)
         y_vel_del = self.pid_vel_y.update(err_vel_y, self.dt)
         thrust_des = self.pid_vel_z.update(err_vel_z, self.dt)
 
-        # --- attitude loop (target set to zero oriented wrt local frame) ---
-        err_roll = -curr_att[:, 0]
+        # --- attitude loop (保持水平 + 航向角归零) ---
+        err_roll  = -curr_att[:, 0]
         err_pitch = -curr_att[:, 1]
-        err_yaw = -curr_att[:, 2]
+        err_yaw   = -curr_att[:, 2]
 
-        roll_del = self.pid_att_roll.update(err_roll, self.dt)
+        roll_del  = self.pid_att_roll.update(err_roll, self.dt)
         pitch_del = self.pid_att_pitch.update(err_pitch, self.dt)
-        yaw_del = self.pid_att_yaw.update(err_yaw, self.dt)
+        yaw_del   = self.pid_att_yaw.update(err_yaw, self.dt)
 
-        # compute rpms
-        prop_rpms = self._mixer(thrust_des, roll_del, pitch_del, yaw_del, x_vel_del, y_vel_del)  # [N,4]
+        # --- mixer ---
+        prop_rpms = self._mixer(thrust_des, roll_del, pitch_del, yaw_del, x_vel_del, y_vel_del)
         return prop_rpms
