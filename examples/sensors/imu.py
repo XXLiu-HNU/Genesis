@@ -22,10 +22,6 @@ def main():
     ########################## create a scene ##########################
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=args.timestep),
-        rigid_options=gs.options.RigidOptions(
-            use_gjk_collision=True,
-            constraint_timeconst=max(0.01, 2 * args.timestep),
-        ),
         vis_options=gs.options.VisOptions(show_world_frame=False),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(3.5, 0.0, 2.5),
@@ -60,7 +56,7 @@ def main():
             interpolate=True,
         )
     )
-    labels = {"lin_acc": ["acc_x", "acc_y", "acc_z"], "ang_vel": ["gyro_x", "gyro_y", "gyro_z"]}
+    labels = {"lin_acc": ("acc_x", "acc_y", "acc_z"), "ang_vel": ("gyro_x", "gyro_y", "gyro_z")}
     if args.vis:
         if IS_PYQTGRAPH_AVAILABLE:
             imu.start_recording(gs.recorders.PyQtPlot(title="IMU Measured Data", labels=labels))
@@ -98,21 +94,21 @@ def main():
     circle_radius = 0.15
     rate = np.deg2rad(2.0)
 
-    def control_franka_circle_path(i):
-        pos = circle_center + np.array([np.cos(i * rate), np.sin(i * rate), 0]) * circle_radius
-        qpos = franka.inverse_kinematics(
-            link=end_effector,
-            pos=pos,
-            quat=np.array([0.0, 1.0, 0.0, 0.0]),
-        )
-        franka.control_dofs_position(qpos[:-2], motors_dof)
-        scene.draw_debug_sphere(pos, radius=0.01, color=(1.0, 0.0, 0.0, 0.5))
-
     try:
         steps = int(args.seconds / args.timestep)
-        for i in tqdm(range(steps), total=steps):
+        for i in tqdm(range(steps)):
             scene.step()
-            control_franka_circle_path(i)
+
+            # control franka to move in a circle and draw the target positions
+            pos = circle_center + np.array([np.cos(i * rate), np.sin(i * rate), 0]) * circle_radius
+            qpos = franka.inverse_kinematics(
+                link=end_effector,
+                pos=pos,
+                quat=np.array([0.0, 1.0, 0.0, 0.0]),
+            )
+            franka.control_dofs_position(qpos[:-2], motors_dof)
+            scene.draw_debug_sphere(pos, radius=0.01, color=(1.0, 0.0, 0.0, 0.5))
+
     except KeyboardInterrupt:
         gs.logger.info("Simulation interrupted, exiting.")
     finally:
