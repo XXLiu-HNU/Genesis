@@ -91,7 +91,7 @@ def get_cfgs():
     }
 
     obs_cfg = {
-        "num_obs": 13,
+        "num_obs": 19,
         "obs_scales": {
             "rel_pos": 1 / 3.0,
             "lin_vel": 1 / 3.0,
@@ -108,24 +108,19 @@ def get_cfgs():
     #         "crash": -10.0,
     #     },
     # }
+    # 在你的配置文件中
     reward_cfg = {
-        "yaw_lambda": -10.0,
         "reward_scales": {
-            "distance_horizontal": 1e-2,
-            "distance_vertical": 1e-2,
-            # "smooth": -1e-4,
-            # "angular": -2e-4,
-            "crash": -1.0,
+            "distance_horizontal": 1.0,   # 建议从稍大的值开始
+            "distance_vertical": 1.0,     # 建议从稍大的值开始
+            "yaw_alignment": 0.5,         # 新增：鼓励机头对准目标
+            "smooth": -0.01,              # 惩罚动作抖动
+            "crash": -5.0,                # 给予一个更显著的碰撞惩罚
         },
     }
-    command_cfg = {
-        "num_commands": 3,
-        "pos_x_range": [-1.0, 1.0],
-        "pos_y_range": [-1.0, 1.0],
-        "pos_z_range": [1.0, 1.0],
-    }
 
-    return env_cfg, obs_cfg, reward_cfg, command_cfg
+
+    return env_cfg, obs_cfg, reward_cfg
 
 
 def main():
@@ -139,7 +134,7 @@ def main():
     gs.init(logging_level="warning")
 
     log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
+    env_cfg, obs_cfg, reward_cfg = get_cfgs()
     train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
 
     if os.path.exists(log_dir):
@@ -150,7 +145,7 @@ def main():
         env_cfg["visualize_target"] = True
 
     pickle.dump(
-        [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg],
+        [env_cfg, obs_cfg, reward_cfg, train_cfg],
         open(f"{log_dir}/cfgs.pkl", "wb"),
     )
 
@@ -159,7 +154,6 @@ def main():
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
-        command_cfg=command_cfg,
         show_viewer=args.vis,
     )
 

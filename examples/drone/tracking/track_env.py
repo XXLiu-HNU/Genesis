@@ -16,13 +16,12 @@ def gs_rand_float(lower, upper, shape, device):
 
 
 class TrackerEnv:
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False):
         self.num_envs = num_envs
         self.rendered_env_num = min(10, self.num_envs)
         self.num_obs = obs_cfg["num_obs"]
         self.num_privileged_obs = None
         self.num_actions = env_cfg["num_actions"]
-        self.num_commands = command_cfg["num_commands"]
         self.device = gs.device
         self.od_min_sq = 1.0*1.0
         self.od_max_sq = 3.0*3.0
@@ -34,8 +33,7 @@ class TrackerEnv:
         self.env_cfg = env_cfg
         self.obs_cfg = obs_cfg
         self.reward_cfg = reward_cfg
-        self.command_cfg = command_cfg
-
+        
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
 
@@ -56,29 +54,12 @@ class TrackerEnv:
                 enable_joint_limit=True,
             ),
             show_viewer=show_viewer,
-            show_FPS=False
+            profiling_options=gs.options.ProfilingOptions(show_FPS=False)
         )
 
         # add plane
         self.scene.add_entity(gs.morphs.Plane())
 
-        # add target
-        if self.env_cfg["visualize_target"]:
-            self.target = self.scene.add_entity(
-                morph=gs.morphs.Mesh(
-                    file="meshes/sphere.obj",
-                    scale=0.05,
-                    fixed=False,
-                    collision=False,
-                ),
-                surface=gs.surfaces.Rough(
-                    diffuse_texture=gs.textures.ColorTexture(
-                        color=(1.0, 0.5, 0.5),
-                    ),
-                ),
-            )
-        else:
-            self.target = None
 
         # add camera
         if self.env_cfg["visualize_camera"]:
@@ -190,8 +171,9 @@ class TrackerEnv:
         self.tracker_last_pos[:] = self.tracker_pos[:]
         self.tracker_pos[:] = self.tracker.get_pos()
 
-        self.target_pos[:] = self.target.get_pos()
+
         self.target_last_pos[:] = self.target_pos[:]
+        self.target_pos[:] = self.target.get_pos()
 
 
         self.rel_pos = self.target_pos - self.tracker_pos
@@ -199,7 +181,7 @@ class TrackerEnv:
         self.tracker_quat[:] = self.tracker.get_quat()
         self.tracker_euler = quat_to_xyz(
             transform_quat_by_quat(
-                torch.ones_like(self.tracker_quat) * self.target_inv_init_quat,
+                torch.ones_like(self.tracker_quat) * self.tracker_inv_init_quat,
                 self.tracker_quat,
             ),
             rpy=True,
@@ -269,15 +251,18 @@ class TrackerEnv:
 
         # compute observations
         self.obs_buf = torch.cat(
-            [
-                torch.clip(self.rel_pos * self.obs_scales["rel_pos"], -1, 1),
-                self.tracker_quat,
-                torch.clip(self.target_lin_vel * self.obs_scales["lin_vel"], -1, 1),
-                self.last_actions,
-            ],
-            axis=-1,
-        )
-
+        [
+            self.rel_pos * self.obs_scales["rel_pos"],
+            self.tracker_quat,
+            # 新增：追踪者自身的线速度和角速度
+            torch.clip(self.tracker_lin_vel * self.obs_scales["lin_vel"], -1, 1),
+            torch.clip(self.tracker_ang_vel * self.obs_scales["ang_vel"], -1, 1),
+            # 目标的速度
+            torch.clip(self.target_lin_vel * self.obs_scales["lin_vel"], -1, 1),
+            self.last_actions,
+        ],
+        axis=-1,
+    )
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
 
@@ -304,8 +289,25 @@ class TrackerEnv:
         self.tracker.zero_all_dofs_velocity(envs_idx)
 
         # reset target base
-        self.target_pos[envs_idx] = self.target_init_pos + torch.tensor([3.0, 0.0, 0.0], device=gs.device)
-        self.target_last_pos[envs_idx] = self.target_init_pos
+         # --- 重置 target (加入随机化) ---
+        # 在一个范围内随机生成目标的位置
+        # 例如：x,y 在 [-2, 2] 之间，z 在 [0.5, 1.5] 之间
+        num_resets = len(envs_idx)
+        random_pos_xy = gs_rand_float(-2.0, 2.0, (num_resets, 2), self.device)
+        random_pos_z = gs_rand_float(0.5, 1.5, (num_resets, 1), self.device)
+        random_offset = torch.cat([random_pos_xy, random_pos_z], dim=-1)
+        
+        # 将初始位置应用随机偏移
+        # 注意：这里我们让 target 的初始位置在 tracker 的基础上进行随机化
+        target_start_pos = self.tracker_init_pos + random_offset
+        
+        # 检查并确保 target 不会与 tracker 初始位置太近
+        dist_sq = torch.sum(torch.square(random_offset[:, :2]), dim=1)
+        too_close = dist_sq < 0.5*0.5
+        target_start_pos[too_close, 0] += torch.sign(target_start_pos[too_close, 0]) * 1.0 # 如果太近，在x轴上推开
+        
+        self.target_pos[envs_idx] = target_start_pos
+        self.target_last_pos[envs_idx] = target_start_pos
         self.target_quat[envs_idx] = self.target_init_quat.reshape(1, -1)
         self.target.set_pos(self.target_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
         self.target.set_quat(self.target_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
@@ -408,3 +410,18 @@ class TrackerEnv:
         reward = torch.clamp(reward, min=-2.0, max=1.0)
         
         return reward
+    def _reward_yaw_alignment(self):
+        # 追踪者的前向向量 (在世界坐标系下)
+        # 假设机头方向为 body-frame 的 x 轴
+        forward_vec_body = torch.tensor([1.0, 0, 0], device=self.device).expand(self.num_envs, -1)
+        forward_vec_world = transform_by_quat(forward_vec_body, self.tracker_quat)
+
+        # 指向目标的方向向量
+        direction_to_target = self.rel_pos
+        direction_to_target_normalized = direction_to_target / (torch.norm(direction_to_target, dim=-1, keepdim=True) + 1e-6)
+
+        # 计算点积，衡量对准程度。值越大越好。
+        alignment_dot_product = torch.sum(forward_vec_world * direction_to_target_normalized, dim=-1)
+
+        # 奖励值在 [-1, 1] 之间。我们希望它接近 1。
+        return alignment_dot_product
