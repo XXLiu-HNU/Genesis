@@ -69,6 +69,7 @@ def main():
         else:
             for _ in range(max_sim_step):
                 actions = policy(obs)
+                print(actions)
                 obs, rews, dones, infos = env.step(actions)
 
 

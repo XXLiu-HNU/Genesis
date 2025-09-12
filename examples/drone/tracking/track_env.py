@@ -48,7 +48,7 @@ class TrackerEnv:
                 camera_lookat=(0.0, 0.0, 1.0),
                 camera_fov=40,
             ),
-            vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(self.rendered_env_num))),
+            vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(self.rendered_env_num))),  
             rigid_options=gs.options.RigidOptions(
                 dt=self.dt,
                 constraint_solver=gs.constraint_solver.Newton,
@@ -56,6 +56,7 @@ class TrackerEnv:
                 enable_joint_limit=True,
             ),
             show_viewer=show_viewer,
+            show_FPS=False
         )
 
         # add plane
@@ -303,7 +304,7 @@ class TrackerEnv:
         self.tracker.zero_all_dofs_velocity(envs_idx)
 
         # reset target base
-        self.target_pos[envs_idx] = self.target_init_pos + torch.tensor([1.0, 0.0, 0.0], device=gs.device)
+        self.target_pos[envs_idx] = self.target_init_pos + torch.tensor([3.0, 0.0, 0.0], device=gs.device)
         self.target_last_pos[envs_idx] = self.target_init_pos
         self.target_quat[envs_idx] = self.target_init_quat.reshape(1, -1)
         self.target.set_pos(self.target_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
