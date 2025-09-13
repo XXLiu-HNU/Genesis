@@ -76,7 +76,8 @@ class PIDcontroller:
 
         self.rate_controller(action)
         cmd = self.mixer(action)
-        self.drone.set_propellels_rpm(cmd.squeeze(0))
+        return cmd 
+        
 
     def rate_controller(self, action=None): 
         """
@@ -85,7 +86,7 @@ class PIDcontroller:
             action: torch.Size([num_envs, 4]), like [[roll, pitch, yaw, thrust]] if num_envs = 1
         """
         
-        self.body_set_point[:] = action[:, :3] * 1
+        self.body_set_point[:] = action[:, :3] * 15 # max angle rate is 15 rad/s
 
         self.last_setpoint_error[:] = self.cur_setpoint_error
         ang_vel = self.drone.get_ang()

@@ -68,7 +68,7 @@ def get_train_cfg(exp_name, max_iterations):
 
 def get_cfgs():
     env_cfg = {
-        "num_actions": 3,
+        "num_actions": 4,
         # termination
         "termination_if_roll_greater_than": 90,  # degree
         "termination_if_pitch_greater_than": 90,
@@ -91,7 +91,7 @@ def get_cfgs():
     }
 
     obs_cfg = {
-        "num_obs": 19,
+        "num_obs": 20,
         "obs_scales": {
             "max_diff": 1 / 5.0,
             "max_lin": 1 / 3.0,
@@ -116,7 +116,7 @@ def get_cfgs():
             "yaw_alignment": 0.5,         # 新增：鼓励机头对准目标
             "smooth": -0.01,              # 惩罚动作抖动
             "crash": -5.0,                # 给予一个更显著的碰撞惩罚
-            "max_speed": -0.5,         # 新增： Penalize high speeds
+            # "max_speed": -0.5,         # 新增： Penalize high speeds
         },
     }
 
@@ -129,7 +129,7 @@ def main():
     parser.add_argument("-e", "--exp_name", type=str, default="drone-hovering")
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=8192)
-    parser.add_argument("--max_iterations", type=int, default=301)
+    parser.add_argument("--max_iterations", type=int, default=2001)
     args = parser.parse_args()
 
     gs.init(logging_level="warning")

@@ -3,6 +3,7 @@ import math
 import copy
 import genesis as gs
 from quadcopter_controller import DronePIDController
+from pid import PIDcontroller
 from genesis.utils.geom import (
     quat_to_xyz,
     transform_by_quat,
@@ -75,7 +76,7 @@ class TrackerEnv:
         self.tracker_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
         self.tracker_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.tracker_inv_init_quat = inv_quat(self.tracker_init_quat)
-        self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
+        self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
 
         # add traget
         self.target_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
@@ -128,10 +129,20 @@ class TrackerEnv:
         [100.0, 0.0, 10.0],
         [200.0, 0.0, 10.0],
         ]
-
+        pid_params = {
+            "kp": 6500,
+            "ki": 0.01,
+            "kd": 0.0,
+            "kf": 0.0,
+            "thrust_compensate": 0.0,
+            "pid_exec_freq": 60,
+            "base_rpm": 62293.9641914,
+            }
         base_rpm = 14468.429183500699
-        self.tracker_controller = DronePIDController(drone=self.tracker, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
-        self.target_controller = DronePIDController(drone=self.target, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
+        # self.tracker_controller = DronePIDController(drone=self.tracker, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
+        self.tracker_controller = PIDcontroller(drone=self.tracker, config=pid_params)
+        # self.target_controller = DronePIDController(drone=self.target, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
+        self.target_controller = PIDcontroller(drone=self.target, config=pid_params)
 
 
     def _collision_detect(self):
@@ -152,12 +163,12 @@ class TrackerEnv:
     def step(self, actions):
         
         # self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
-        self.actions = actions
-        exec_actions = self.actions
+        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
 
-        prop_rpms = self.tracker_controller.update(self.actions)   # [N,4] tensor
+        prop_rpms = self.tracker_controller.update(self.actions)   # [N,4] tensor\
         self.tracker.set_propellels_rpm(prop_rpms)                  # 假设 set_propellels_rpm 支持 batched tensor
 
+        
         hover_rpm = torch.ones(
             (self.num_envs, 4), device=self.device
         ) * 62293.9641914 # 59489.68 for cf2x, 39777.86 for our drone
