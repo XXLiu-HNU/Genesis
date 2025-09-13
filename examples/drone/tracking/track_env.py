@@ -396,19 +396,8 @@ class TrackerEnv:
         
         # 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
         # sigma控制奖励随距离衰减的速度，可以根据实际需求调整
-        sigma = 2.0
+        sigma = 0.5
         reward = torch.exp(-0.5 * (vertical_dist / sigma)**2)
-        
-        # 对于过大的垂直距离添加额外惩罚
-        max_allowed_dist = 1.5  # 最大允许的垂直距离
-        penalty = torch.clamp(vertical_dist - max_allowed_dist, min=0.0)**2
-        penalty_scale = 0.1  # 惩罚系数
-        
-        # 将惩罚项加入到最终奖励中
-        reward = reward - penalty_scale * penalty
-    
-        # 限制奖励范围
-        reward = torch.clamp(reward, min=-2.0, max=1.0)
         
         return reward
     def _reward_yaw_alignment(self):
