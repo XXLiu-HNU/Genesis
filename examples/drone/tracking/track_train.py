@@ -93,9 +93,9 @@ def get_cfgs():
     obs_cfg = {
         "num_obs": 19,
         "obs_scales": {
-            "rel_pos": 1 / 3.0,
-            "lin_vel": 1 / 3.0,
-            "ang_vel": 1 / 3.14159,
+            "max_diff": 1 / 5.0,
+            "max_lin": 1 / 3.0,
+            "max_ang": 1 / 3.14159,
         },
     }
     # reward_cfg = {
@@ -116,6 +116,7 @@ def get_cfgs():
             "yaw_alignment": 0.5,         # 新增：鼓励机头对准目标
             "smooth": -0.01,              # 惩罚动作抖动
             "crash": -5.0,                # 给予一个更显著的碰撞惩罚
+            "max_speed": -0.5,         # 新增： Penalize high speeds
         },
     }
 

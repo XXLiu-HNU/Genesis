@@ -151,7 +151,8 @@ class TrackerEnv:
 
     def step(self, actions):
         
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        # self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        self.actions = actions
         exec_actions = self.actions
 
         prop_rpms = self.tracker_controller.update(self.actions)   # [N,4] tensor
@@ -251,18 +252,18 @@ class TrackerEnv:
 
         # compute observations
         self.obs_buf = torch.cat(
-        [
-            self.rel_pos * self.obs_scales["rel_pos"],
-            self.tracker_quat,
-            # 新增：追踪者自身的线速度和角速度
-            torch.clip(self.tracker_lin_vel * self.obs_scales["lin_vel"], -1, 1),
-            torch.clip(self.tracker_ang_vel * self.obs_scales["ang_vel"], -1, 1),
-            # 目标的速度
-            torch.clip(self.target_lin_vel * self.obs_scales["lin_vel"], -1, 1),
-            self.last_actions,
-        ],
-        axis=-1,
-    )
+            [
+                torch.clip(self.rel_pos * self.obs_scales["max_diff"], -1, 1),
+                self.tracker_quat,
+                # 新增：追踪者自身的线速度和角速度
+                torch.clip(self.tracker_lin_vel * self.obs_scales["max_lin"], -1, 1),
+                torch.clip(self.tracker_ang_vel * self.obs_scales["max_ang"], -1, 1),
+                # 目标的速度
+                torch.clip(self.target_lin_vel * self.obs_scales["max_lin"], -1, 1),
+                torch.clip(self.last_actions * self.obs_scales["max_lin"], -1, 1)
+            ],
+            axis=-1,
+        )
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
 
@@ -425,3 +426,32 @@ class TrackerEnv:
 
         # 奖励值在 [-1, 1] 之间。我们希望它接近 1。
         return alignment_dot_product
+    
+    def _reward_max_speed(self):
+        """
+        对速度超过物理极限的行为进行惩罚。
+        使用指数函数对超速进行强力惩罚。
+        """
+        # 假设你的无人机线速度存储在 self.tracker_lin_vel 中
+        # 计算线速度的范数（即速度大小）
+        speed_norm = torch.norm(self.actions, dim=-1)
+
+        # 定义最大允许速度，例如 5 m/s
+        # 你需要根据你的环境和无人机物理特性来设定这个值
+        max_speed = 2.0
+        
+        # 计算超出最大速度的部分，小于等于0的部分为0
+        exceed_speed = torch.clamp(speed_norm - max_speed, min=0.0)
+
+        # 根据公式计算奖励/惩罚
+        # exp(x) 增长非常快，因此这里可以根据你的实际需求调整常数
+        # 这里我们使用一个简单的线性惩罚，更易于控制
+        # 惩罚 = - (超速部分的平方) * 惩罚系数
+        # 这样可以对轻微超速进行轻微惩罚，对严重超速进行强力惩罚
+        speed_penalty = (exceed_speed ** 2) * 2.0  # 惩罚系数 2.0
+        
+        # 另一种更接近你提供的公式的实现，但是更难调参
+        # 你提供的公式可能会导致非常大的负奖励，需要谨慎使用
+        # speed_penalty = -torch.exp(exceed_speed + 1) + 1
+        
+        return speed_penalty

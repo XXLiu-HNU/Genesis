@@ -62,6 +62,7 @@ def main():
             env.cam.start_recording()
             for _ in range(max_sim_step):
                 actions = policy(obs)
+                print(actions)
                 obs, rews, dones, infos = env.step(actions)
                 env.cam.render()
             env.cam.stop_recording(save_to_filename="video.mp4", fps=env_cfg["max_visualize_FPS"])
