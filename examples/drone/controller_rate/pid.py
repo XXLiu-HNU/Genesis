@@ -13,7 +13,7 @@ class PIDcontroller:
             config, 
             device = torch.device("cuda")):
         self.drone = drone
-        self.num_envs = self.drone.get_pos().shape[0]
+        self.num_envs = 1
         self.device = device
 
 
@@ -76,7 +76,8 @@ class PIDcontroller:
 
         self.rate_controller(action)
         cmd = self.mixer(action)
-        self.drone.set_propellels_rpm(cmd.squeeze(0))
+        return cmd
+        
 
     def rate_controller(self, action=None): 
         """
@@ -84,18 +85,23 @@ class PIDcontroller:
         :param: 
             action: torch.Size([num_envs, 4]), like [[roll, pitch, yaw, thrust]] if num_envs = 1
         """
-        
+        # print(action)
         self.body_set_point[:] = action[:, :3] * 1
-
+        # print(self.body_set_point)
         self.last_setpoint_error[:] = self.cur_setpoint_error
         ang_vel = self.drone.get_ang()
         body_ang_vel = transform_by_quat(ang_vel, inv_quat(self.drone.get_quat()))
         self.cur_setpoint_error[:] = self.body_set_point - body_ang_vel
+        print("cur_setpoint_error:",self.cur_setpoint_error)
+        print("kp_r:",self.kp_r)
+        print("kd_r:",self.kd_r)
+        print("ki_r:",self.ki_r)
         self.P_term_r[:] = (self.cur_setpoint_error * self.kp_r) * self.tpa_factor
         self.I_term_r[:] = torch.clamp(self.I_term_r + self.cur_setpoint_error * self.ki_r, -0.5, 0.5)
         self.D_term_r[:] = (self.last_body_ang_vel - body_ang_vel) * self.kd_r * self.tpa_factor    
 
         self.pid_output[:] = (self.P_term_r + self.I_term_r + self.D_term_r)
+        print("pid_output:",self.pid_output)
         self.last_body_ang_vel[:] = body_ang_vel
 
     def reset(self, env_idx=None):

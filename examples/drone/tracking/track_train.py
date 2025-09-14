@@ -113,8 +113,8 @@ def get_cfgs():
         "reward_scales": {
             "distance_horizontal": 1.0,   # 建议从稍大的值开始
             "distance_vertical": 1.0,     # 建议从稍大的值开始
-            "yaw_alignment": 0.5,         # 新增：鼓励机头对准目标
-            "smooth": -0.01,              # 惩罚动作抖动
+            "yaw_alignment": 2,         # 新增：鼓励机头对准目标
+            "smooth": -0.1,              # 惩罚动作抖动
             "crash": -5.0,                # 给予一个更显著的碰撞惩罚
             # "max_speed": -0.5,         # 新增： Penalize high speeds
         },
@@ -129,7 +129,7 @@ def main():
     parser.add_argument("-e", "--exp_name", type=str, default="drone-hovering")
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=8192)
-    parser.add_argument("--max_iterations", type=int, default=2001)
+    parser.add_argument("--max_iterations", type=int, default=301)
     args = parser.parse_args()
 
     gs.init(logging_level="warning")

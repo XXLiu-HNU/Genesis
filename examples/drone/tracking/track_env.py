@@ -130,15 +130,15 @@ class TrackerEnv:
         [200.0, 0.0, 10.0],
         ]
         pid_params = {
-            "kp": 6500,
-            "ki": 0.01,
-            "kd": 0.0,
+            "kp_r": 6500,
+            "ki_r": 0.01,
+            "kd_r": 0.0,
             "kf": 0.0,
             "thrust_compensate": 0.0,
-            "pid_exec_freq": 60,
+            "pid_exec_freq": 100,
             "base_rpm": 62293.9641914,
             }
-        base_rpm = 14468.429183500699
+        # base_rpm = 14468.429183500699
         # self.tracker_controller = DronePIDController(drone=self.tracker, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
         self.tracker_controller = PIDcontroller(drone=self.tracker, config=pid_params)
         # self.target_controller = DronePIDController(drone=self.target, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
@@ -162,10 +162,10 @@ class TrackerEnv:
 
     def step(self, actions):
         
-        # self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        self.actions = actions
+        exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
 
-        prop_rpms = self.tracker_controller.update(self.actions)   # [N,4] tensor\
+        prop_rpms = self.tracker_controller.update(exec_actions)   # [N,4] tensor\
         self.tracker.set_propellels_rpm(prop_rpms)                  # 假设 set_propellels_rpm 支持 batched tensor
 
         
@@ -354,7 +354,9 @@ class TrackerEnv:
         return target_rew
 
     def _reward_smooth(self):
-        smooth_rew = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        smooth_action = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        smooth_attitude = torch.sum(torch.square(self.actions[:,:3]), dim=1)
+        smooth_rew = smooth_action + smooth_attitude
         return smooth_rew
 
     def _reward_yaw(self):

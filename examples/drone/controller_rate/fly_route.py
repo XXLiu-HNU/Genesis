@@ -18,9 +18,10 @@ def fly_to_point(drone: DroneEntity, target, controller: PIDcontroller, scene: g
     distance = math.sqrt(x**2 + y**2 + z**2)
 
     while  step < 1000:
-        target = torch.randn([1,4])
-        controller.step(target)
-        
+        target = torch.tensor([[0, 0, 30, 0.4]])
+        cmd = controller.update(target)
+        print(cmd)
+        drone.set_propellels_rpm(cmd.squeeze(0))
         scene.step()
         cam.render()
         # print("point =", drone.get_pos())
@@ -42,22 +43,21 @@ def main():
     # parameters are tuned such that the
     # drone can fly, not optimized
     pid_params = {
-        "kp": 6500,
-        "ki": 0.01,
-        "kd": 0.0,
+        "kp_r": 6500,
+        "ki_r": 0.01,
+        "kd_r": 0.0,
         "kf": 0.0,
         "thrust_compensate": 0.0,
         "pid_exec_freq": 60,
         "base_rpm": base_rpm,
     }
-    controller = PIDcontroller(drone=drone, config=pid_params)
 
     cam = scene.add_camera(pos=(1, 1, 1),  GUI=False, res=(640, 480), fov=30)
 
     ##### build #####
 
     scene.build()
-
+    controller = PIDcontroller(drone=drone, config=pid_params)
 
     points = [(1, 1, 2), (-1, 2, 1), (0, 0, 0.5)]
 
