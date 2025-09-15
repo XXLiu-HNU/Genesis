@@ -1,16 +1,18 @@
+import os
 import torch
 import math
 import copy
+import yaml
 import genesis as gs
 from quadcopter_controller import DronePIDController
 from pid import PIDcontroller
+from odom import Odom
 from genesis.utils.geom import (
     quat_to_xyz,
     transform_by_quat,
     inv_quat,
     transform_quat_by_quat,
 )
-
 
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
@@ -61,7 +63,6 @@ class TrackerEnv:
         # add plane
         self.scene.add_entity(gs.morphs.Plane())
 
-
         # add camera
         if self.env_cfg["visualize_camera"]:
             self.cam = self.scene.add_camera(
@@ -72,17 +73,32 @@ class TrackerEnv:
                 GUI=True,
             )
 
-        # add tracker
+        # Add Tracker
         self.tracker_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
         self.tracker_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.tracker_inv_init_quat = inv_quat(self.tracker_init_quat)
         self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
 
-        # add traget
+        # Add Traget
+        self.circle_radius = torch.ones(self.num_envs, device=self.device)
+        self.target_height = torch.ones(self.num_envs, device=self.device)
+        self.circle_omega = torch.ones(self.num_envs, device=self.device)
+        self.circle_center = torch.tensor([0.0, 0.0, 1.0], device=self.device) 
+
         self.target_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
         self.target_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.target_inv_init_quat = inv_quat(self.target_init_quat)
         self.target = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(script_dir, "config/pos.yaml"), "r") as file:
+                self.pos_ctrl_config = yaml.load(file, Loader=yaml.FullLoader)
+        with open(os.path.join(script_dir, "config/rate.yaml"), "r") as file:
+                self.rate_ctrl_config = yaml.load(file, Loader=yaml.FullLoader)
+
+        # Add odom and controller for drone
+        self._setup_imu_and_controller(self.tracker, "rate", self.rate_ctrl_config)
+        self._setup_imu_and_controller(self.target, "position", self.pos_ctrl_config)
         
         # build scene
         self.scene.build(n_envs=num_envs)
@@ -114,36 +130,12 @@ class TrackerEnv:
         self.target_lin_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.target_ang_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.target_last_pos = torch.zeros_like(self.target_pos)
+        self.initial_angle = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+
+        self.rel_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
 
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
-
-        pid_params = [
-        [2.0, 0.0, 0.0],
-        [2.0, 0.0, 0.0],
-        [2.0, 0.0, 0.0],
-        [200.0, 0.0, 30.0],
-        [200.0, 0.0, 30.0],
-        [600.0, 0.0, 60.0],
-        [100.0, 0.0, 10.0],
-        [100.0, 0.0, 10.0],
-        [200.0, 0.0, 10.0],
-        ]
-        pid_params = {
-            "kp_r": 6500,
-            "ki_r": 0.01,
-            "kd_r": 0.0,
-            "kf": 0.0,
-            "thrust_compensate": 0.0,
-            "pid_exec_freq": 100,
-            "base_rpm": 62293.9641914,
-            }
-        # base_rpm = 14468.429183500699
-        # self.tracker_controller = DronePIDController(drone=self.tracker, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
-        self.tracker_controller = PIDcontroller(drone=self.tracker, config=pid_params)
-        # self.target_controller = DronePIDController(drone=self.target, dt=0.01, base_rpm=base_rpm, pid_params=pid_params)
-        self.target_controller = PIDcontroller(drone=self.target, config=pid_params)
-
 
     def _collision_detect(self):
         # TODO 
@@ -164,17 +156,13 @@ class TrackerEnv:
         
         self.actions = actions
         exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+    
+        tracker_prop_rpms = self.tracker.controller.step(exec_actions)       # [N,4] tensor 
+        self.tracker.set_propellels_rpm(tracker_prop_rpms)                  # 假设 set_propellels_rpm 支持 batched tensor
 
-        prop_rpms = self.tracker_controller.update(exec_actions)   # [N,4] tensor\
-        self.tracker.set_propellels_rpm(prop_rpms)                  # 假设 set_propellels_rpm 支持 batched tensor
-
-        
-        hover_rpm = torch.ones(
-            (self.num_envs, 4), device=self.device
-        ) * 62293.9641914 # 59489.68 for cf2x, 39777.86 for our drone
-        self.target.set_propellels_rpm(hover_rpm)
-
-        # 14468 is hover rpm
+        circle_traj = self._get_circle_traj()
+        target_prop_rpms = self.target.controller.step(circle_traj) 
+        self.target.set_propellels_rpm(target_prop_rpms)
 
         self.scene.step()
 
@@ -290,52 +278,52 @@ class TrackerEnv:
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
             return
-        # reset tracker base
+
+        num_resets = len(envs_idx)
+
+        # 重置追踪器 (tracker)
         self.tracker_pos[envs_idx] = self.tracker_init_pos
         self.tracker_last_pos[envs_idx] = self.tracker_init_pos
-        self.tracker_quat[envs_idx] = self.tracker_init_quat.reshape(1, -1)
+        self.tracker_quat[envs_idx] = self.tracker_init_quat.repeat(num_resets, 1)
         self.tracker.set_pos(self.tracker_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
         self.tracker.set_quat(self.tracker_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
-        self.tracker_lin_vel[envs_idx] = 0
-        self.tracker_ang_vel[envs_idx] = 0
+        self.tracker_lin_vel[envs_idx] = 0.0
+        self.tracker_ang_vel[envs_idx] = 0.0
         self.tracker.zero_all_dofs_velocity(envs_idx)
 
-        # reset target base
-         # --- 重置 target (加入随机化) ---
-        # 在一个范围内随机生成目标的位置
-        # 例如：x,y 在 [-2, 2] 之间，z 在 [0.5, 1.5] 之间
-        num_resets = len(envs_idx)
-        random_pos_xy = gs_rand_float(-2.0, 2.0, (num_resets, 2), self.device)
-        random_pos_z = gs_rand_float(0.5, 1.5, (num_resets, 1), self.device)
-        random_offset = torch.cat([random_pos_xy, random_pos_z], dim=-1)
+        # 重置目标 (target)
+        # 随机化圆的参数
+        self.circle_radius[envs_idx] = gs_rand_float(2.0, 4.0, (num_resets,), self.device)
+        self.target_height[envs_idx] = gs_rand_float(1.0, 2.5, (num_resets,), self.device)
+        self.circle_omega[envs_idx] = gs_rand_float(0.5, 1.0, (num_resets,), self.device)
         
-        # 将初始位置应用随机偏移
-        # 注意：这里我们让 target 的初始位置在 tracker 的基础上进行随机化
-        target_start_pos = self.tracker_init_pos + random_offset
+        # 随机化初始角度
+        self.initial_angle[envs_idx] = gs_rand_float(0, 2 * math.pi, (num_resets,), self.device)
         
-        # 检查并确保 target 不会与 tracker 初始位置太近
-        dist_sq = torch.sum(torch.square(random_offset[:, :2]), dim=1)
-        too_close = dist_sq < 0.5*0.5
-        target_start_pos[too_close, 0] += torch.sign(target_start_pos[too_close, 0]) * 1.0 # 如果太近，在x轴上推开
+        # 计算新的起始位置
+        new_target_pos = torch.zeros((num_resets, 3), device=self.device)
+        new_target_pos[:, 0] = self.circle_center[0] + self.circle_radius[envs_idx] * torch.cos(self.initial_angle[envs_idx])
+        new_target_pos[:, 1] = self.circle_center[1] + self.circle_radius[envs_idx] * torch.sin(self.initial_angle[envs_idx])
+        new_target_pos[:, 2] = self.target_height[envs_idx]
         
-        self.target_pos[envs_idx] = target_start_pos
-        self.target_last_pos[envs_idx] = target_start_pos
-        self.target_quat[envs_idx] = self.target_init_quat.reshape(1, -1)
+        self.target_pos[envs_idx] = new_target_pos
+        self.target_last_pos[envs_idx] = new_target_pos
+        self.target_quat[envs_idx] = self.target_init_quat.repeat(num_resets, 1)
         self.target.set_pos(self.target_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
         self.target.set_quat(self.target_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
-        self.target_lin_vel[envs_idx] = 0
-        self.target_ang_vel[envs_idx] = 0
+        self.target_lin_vel[envs_idx] = 0.0
+        self.target_ang_vel[envs_idx] = 0.0
         self.target.zero_all_dofs_velocity(envs_idx)
+        
+        # 重新计算相对位置
+        self.rel_pos[envs_idx] = self.target_pos[envs_idx] - self.tracker_pos[envs_idx]
 
-        self.rel_pos = self.target_pos - self.tracker_pos
-
-
-        # reset buffers
+        # 重置缓冲区
         self.last_actions[envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
 
-        # fill extras
+        # 填充额外信息
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = (
@@ -348,7 +336,42 @@ class TrackerEnv:
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         return self.obs_buf, None
 
-    # ------------ reward functions----------------
+    def _get_circle_traj(self):        
+        # 将步数转换为弧度
+        angle = self.initial_angle + self.episode_length_buf * self.dt * self.circle_omega
+        
+        # 计算新位置的x和y坐标
+        x = self.circle_radius * torch.cos(angle)
+        y = self.circle_radius * torch.sin(angle)
+        z = self.target_height * torch.ones_like(x)
+        t = torch.zeros_like(x)
+
+        # 返回目标位置张量
+        return torch.stack([x, y, z, t], dim=1)
+
+    def _setup_imu_and_controller(self, drone, controller_type, config):
+        # Setup Odom (IMU) for the drone
+        odom = Odom(
+            num_envs=self.num_envs,
+            device=self.device
+        )
+        odom.set_drone(drone)
+        setattr(drone, 'odom', odom)
+
+        # Setup PID controller for the drone
+        pid = PIDcontroller(
+            num_envs=self.num_envs,
+            odom=drone.odom,
+            config=config,
+            device=self.device,
+            controller=controller_type,
+        )
+        pid.set_drone(drone)
+        setattr(drone, 'controller', pid)
+
+    # -------------------------------------------- reward functions--------------------------------
+
+    # ------------------------------------------------------------------------------------------------
     def _reward_target(self):
         target_rew = torch.sum(torch.square(self.last_rel_pos), dim=1) - torch.sum(torch.square(self.rel_pos), dim=1)
         return target_rew
@@ -413,6 +436,7 @@ class TrackerEnv:
         reward = torch.exp(-0.5 * (vertical_dist / sigma)**2)
         
         return reward
+
     def _reward_yaw_alignment(self):
         # 追踪者的前向向量 (在世界坐标系下)
         # 假设机头方向为 body-frame 的 x 轴

@@ -38,7 +38,7 @@ def main():
     ##### entities #####
     plane = scene.add_entity(morph=gs.morphs.Plane())
 
-    drone = scene.add_entity(morph=gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf", pos=(0, 0, 0.2)))
+    drone = scene.add_entity(morph=gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf", pos=(0, 0, 2)))
 
     # parameters are tuned such that the
     # drone can fly, not optimized

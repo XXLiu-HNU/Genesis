@@ -1,37 +1,75 @@
-
-
 import torch
 import genesis as gs
 
 import math
-from genesis.utils.geom import transform_by_quat,inv_quat
+from genesis.utils.geom import quat_to_R
+from odom import ve2vb
 
 class PIDcontroller:
     def __init__(
             self, 
-            drone, 
+            num_envs, 
+            odom, 
             config, 
+            controller = "angle",
             device = torch.device("cuda")):
-        self.drone = drone
-        self.num_envs = self.drone.get_pos().shape[0]
+
         self.device = device
-
-
-        self.config = config
+        self.num_envs = num_envs
+        self.odom = odom
         self.thrust_compensate = config.get("thrust_compensate", 0.5)  
+        self.controller = controller
+            
+        if self.controller == "position":
+            self.controller = self.position_controller
+        elif self.controller == "rate":
+            self.controller = self.rate_controller
+        elif self.controller == "angle":
+            self.controller = self.angle_controller
+        else:
+            raise ValueError(f"Invalid controller type: {self.controller}. Choose from 'angle', 'rate', or 'position'.")
+        
+        # Shape: (n, 3)
+        ang_cfg = config.get("ang", {})
+        rat_cfg = config.get("rat", {})
+        pos_cfg = config.get("pos", {})
+        def get3(cfg, k1, k2, k3):
+            return torch.tensor([
+                cfg.get(k1, 0.0),
+                cfg.get(k2, 0.0),
+                cfg.get(k3, 0.0)
+            ], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        
+        # Angular controller (angle controller PID)
+        self.kp_a = get3(ang_cfg, "kp_r", "kp_p", "kp_y")
+        self.ki_a = get3(ang_cfg, "ki_r", "ki_p", "ki_y")
+        self.kd_a = get3(ang_cfg, "kd_r", "kd_p", "kd_y")
+        self.kf_a = get3(ang_cfg, "kf_r", "kf_p", "kf_y")
+        self.P_term_a = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
+        self.I_term_a = torch.zeros_like(self.P_term_a)
+        self.D_term_a = torch.zeros_like(self.P_term_a)
+        self.F_term_a = torch.zeros_like(self.P_term_a)
 
         # Angular Rate controller (angular rate PID)
-        self.kp_r = torch.tensor(self.config.get("kp_r", 0.0), device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-        self.ki_r = torch.tensor(self.config.get("ki_r", 0.0), device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-        self.kd_r = torch.tensor(self.config.get("kd_r", 0.0), device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-        self.kf_r = torch.tensor(self.config.get("kf_r", 0.0), device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-        
+        self.kp_r = get3(rat_cfg, "kp_r", "kp_p", "kp_y")
+        self.ki_r = get3(rat_cfg, "ki_r", "ki_p", "ki_y")
+        self.kd_r = get3(rat_cfg, "kd_r", "kd_p", "kd_y")
+        self.kf_r = get3(rat_cfg, "kf_r", "kf_p", "kf_y")
         self.P_term_r = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.I_term_r = torch.zeros_like(self.P_term_r)
         self.D_term_r = torch.zeros_like(self.P_term_r)
         self.F_term_r = torch.zeros_like(self.P_term_r)
 
-
+        # Position controller (xyz and throttle)
+        self.kp_p = get3(pos_cfg, "kp_x", "kp_y", "kp_t")
+        self.ki_p = get3(pos_cfg, "ki_x", "ki_y", "ki_t")
+        self.kd_p = get3(pos_cfg, "kd_x", "kd_y", "kd_t")
+        self.kf_p = get3(pos_cfg, "kf_x", "kf_y", "kf_t")
+        self.P_term_p = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
+        self.I_term_p = torch.zeros_like(self.P_term_p)
+        self.D_term_p = torch.zeros_like(self.P_term_p)
+        self.F_term_p = torch.zeros_like(self.P_term_p)                
+        
         self.pid_freq = config.get("pid_exec_freq", 60)     # no use
         self.base_rpm = config.get("base_rpm", 14468.429183500699)
         self.dT = 1 / self.pid_freq                         # no use
@@ -48,6 +86,7 @@ class PIDcontroller:
         self.pid_output = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.cur_setpoint_error = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.last_setpoint_error = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
+        self.drone = None
 
         self.cnt = 0
 
@@ -57,10 +96,11 @@ class PIDcontroller:
 
     def mixer(self, action=None) -> torch.Tensor:
 
-
-        throttle_action = torch.clamp((action[:, -1] + self.thrust_compensate) * 3, min=0.1, max=3.0) * self.base_rpm
-        throttle =  throttle_action
-
+        throttle_rc = torch.clamp((self.throttle_command) * 3, 0.0, 3.0) * self.base_rpm
+        # print("throttle_rc:", throttle_rc)
+        throttle_action = torch.clamp(action[:, -1] * 3 + self.thrust_compensate, min=0.0, max=3.0) * self.base_rpm
+        throttle = throttle_rc + throttle_action
+        # print("throttle:", throttle)
         # self.pid_output[:] = torch.clip(self.pid_output[:], -3.0, 3.0)
         motor_outputs = torch.stack([
            throttle - self.pid_output[:, 0] - self.pid_output[:, 1] - self.pid_output[:, 2],  # M1
@@ -72,12 +112,20 @@ class PIDcontroller:
         return torch.clamp(motor_outputs, min=1, max=self.base_rpm * 3.5)  # size: tensor(num_envs, 4)
 
 
-    def update(self, action=None):
-
-        self.rate_controller(action)
-        cmd = self.mixer(action)
-        return cmd 
         
+    def step(self, action=None):
+        # controller test
+        # self.cnt += 1
+        # if self.cnt % 40 == 0:     
+        #     quat = random_quaternion(self.num_envs)
+        #     self.drone.set_quat(quat)
+        #     self.cnt = 0
+        self.odom.odom_update()
+        
+        self.controller(action)
+        cmd = self.mixer(action)
+        return cmd
+        # self.drone.set_propellels_rpm(self.mixer(action))
 
     def rate_controller(self, action=None): 
         """
@@ -85,19 +133,65 @@ class PIDcontroller:
         :param: 
             action: torch.Size([num_envs, 4]), like [[roll, pitch, yaw, thrust]] if num_envs = 1
         """
-        
-        self.body_set_point[:] = action[:, :3] * 15 # max angle rate is 15 rad/s
+       
+        self.body_set_point[:] = action[:, :3] * 15
 
         self.last_setpoint_error[:] = self.cur_setpoint_error
-        ang_vel = self.drone.get_ang()
-        body_ang_vel = transform_by_quat(ang_vel, inv_quat(self.drone.get_quat()))
-        self.cur_setpoint_error[:] = self.body_set_point - body_ang_vel
+        self.cur_setpoint_error[:] = self.body_set_point - self.odom.body_ang_vel
         self.P_term_r[:] = (self.cur_setpoint_error * self.kp_r) * self.tpa_factor
         self.I_term_r[:] = torch.clamp(self.I_term_r + self.cur_setpoint_error * self.ki_r, -0.5, 0.5)
-        self.D_term_r[:] = (self.last_body_ang_vel - body_ang_vel) * self.kd_r * self.tpa_factor    
+        self.D_term_r[:] = (self.last_body_ang_vel - self.odom.body_ang_vel) * self.kd_r * self.tpa_factor    
 
         self.pid_output[:] = (self.P_term_r + self.I_term_r + self.D_term_r)
-        self.last_body_ang_vel[:] = body_ang_vel
+        self.last_body_ang_vel[:] = self.odom.body_ang_vel
+
+    def angle_controller(self, action=None):  
+        """
+        Angle controller, sequence is (roll, pitch, yaw), use previous-D-term PID controller
+        :param: 
+            action: torch.Size([num_envs, 4]), like [[roll, pitch, yaw, thrust]] if num_envs = 1
+        """
+        yaw_mask = torch.tensor([1,1,0], device=self.device)
+                  # in RL mode
+        self.body_set_point[:] = -self.odom.body_euler * yaw_mask + action[:, :3]  # action is in rad, like [[roll, pitch, yaw, thrust]] if num_envs = 1
+
+        self.last_setpoint_error[:] = self.cur_setpoint_error
+        self.cur_setpoint_error[:] = (self.body_set_point * 15 - self.odom.body_ang_vel)
+        self.P_term_a[:] = (self.cur_setpoint_error[:] * self.kp_a) * self.tpa_factor
+        self.I_term_a[:] = torch.clamp(self.I_term_a + self.cur_setpoint_error[:] * self.ki_a, -0.5, 0.5)
+        self.D_term_a[:] = torch.clamp((self.last_body_ang_vel - self.odom.body_ang_vel) * self.kd_a * self.tpa_factor, -0.5, 0.5)    
+        
+        self.pid_output[:] = (self.P_term_a + self.I_term_a + self.D_term_a)
+        self.last_body_ang_vel[:] = self.odom.body_ang_vel
+
+    def position_controller(self, action, head_free=False):
+        """
+        Position controller, sequence is (x, y, z), use previous-D-term PID controller
+        Note that the action is in world frame, (x, y, z) -> (pitch, -roll, throttle)
+        :param: 
+            action: torch.Size([num_envs, 4]), like [[x, y, z, 0]] if num_envs = 1, 0 used to adapt thrust
+            head_free: Keep yaw follow the target, namely keep the drone facing the target direction.
+        """
+        cur_pos_error = (action[:, :3] - self.odom.world_pos)
+        self.cur_setpoint_error[:] = cur_pos_error*5 - self.odom.world_linear_vel
+        self.cur_setpoint_error[:, 1] *= -1                       # since roll increase, y decrease
+        self.cur_setpoint_error = self.cur_setpoint_error[:, [1, 0, 2]]     # change to (roll, pitch, throttle)
+
+        if head_free:
+            # cur_pos_error = ve2vb(cur_pos_error, self.odom.body_euler[:, 2])
+            print("head_free not implemented yet")
+
+        self.P_term_p[:] = (self.cur_setpoint_error[:] * self.kp_p)
+        self.I_term_p[:] = torch.clamp(self.I_term_p + self.cur_setpoint_error[:] * self.ki_p, -0.5, 0.5)
+        self.D_term_p[:] = torch.clamp((self.odom.last_world_linear_vel - self.odom.world_linear_vel) * self.kd_p, -0.5, 0.5)  
+
+        sum = self.P_term_p + self.I_term_p + self.D_term_p 
+        # print("sum:", sum)
+        self.throttle_command = torch.clamp(sum[:,-1], min=0.0, max=0.5)
+
+        # sum[:,-1] = torch.atan2(action[:, 1], action[:, 0])
+        sum[:, -1] = 0
+        self.angle_controller(torch.clamp(sum, -0.5, 0.5))
 
     def reset(self, env_idx=None):
         if env_idx is None:
@@ -159,3 +253,4 @@ def random_quaternion(num_envs=1, device="cuda"):
     quat = torch.cat([w, x, y, z], dim=1)
     quat = quat / quat.norm(dim=1, keepdim=True)
     return quat
+
