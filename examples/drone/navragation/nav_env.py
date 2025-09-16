@@ -17,14 +17,16 @@ def gs_rand_float(lower, upper, shape, device):
 def setup_random_cylindrical_obstacles(scene, n_obstacles=20, n_envs=1, min_radius=0.1, max_radius=0.5,
                                      min_height=1.0, max_height=2.0, min_distance=1.0,
                                      world_bounds=(-10, 10, -10, 10), device="cpu", oversample_factor=10):
-    """
-    Randomly generate cylindrical obstacles using batched tensor sampling (torch only).
-    Ensures no collisions and stays within world bounds.
-    """
-    print(f"Randomly generating {n_obstacles} cylindrical obstacles (Genesis will copy to {n_envs} environments)...")
+    """Randomly generates and places non-overlapping cylindrical obstacles in a scene.
 
-    # Ground plane
-    terrain = scene.add_entity(gs.morphs.Plane())
+    This function uses a batched tensor sampling approach to create a specified number of
+    cylindrical obstacles. It employs an oversampling strategy to generate more candidates
+    than needed, then filters them to ensure they are within world bounds and do not
+    collide with each other, maintaining a minimum distance between them.
+
+    Returns:
+        list: A list of the created gs.Entity obstacle objects.
+    """
 
     # Oversample candidates (more than needed)
     n_candidates = n_obstacles * oversample_factor
@@ -33,7 +35,7 @@ def setup_random_cylindrical_obstacles(scene, n_obstacles=20, n_envs=1, min_radi
     radii = torch.empty(n_candidates, device=device).uniform_(min_radius, max_radius)
     heights = torch.empty(n_candidates, device=device).uniform_(min_height, max_height)
 
-    # Step 1: filter by world bounds
+    # ! ---------------- filter by world bounds ----------------------------------------
     in_bounds = (
         (xs - radii >= world_bounds[0]) &
         (xs + radii <= world_bounds[1]) &
@@ -43,7 +45,7 @@ def setup_random_cylindrical_obstacles(scene, n_obstacles=20, n_envs=1, min_radi
 
     xs, ys, radii, heights = xs[in_bounds], ys[in_bounds], radii[in_bounds], heights[in_bounds]
 
-    # Step 2: enforce min distance constraint iteratively (greedy selection)
+    # ! ---------------- filter by min distance ----------------------------------------
     obstacles = []
     obstacle_positions = []
     obstacle_radii = []
@@ -84,18 +86,10 @@ def setup_random_cylindrical_obstacles(scene, n_obstacles=20, n_envs=1, min_radi
         obstacle_positions.append((x, y))
         obstacle_radii.append(r)
 
-        print(f"  Obstacle {len(obstacles)}: position({x:.2f}, {y:.2f}), radius{r:.2f}, height{h:.2f}")
-
     if len(obstacles) < n_obstacles:
         print(f"Warning: Only generated {len(obstacles)} obstacles (requested {n_obstacles})")
 
-    print(f"Successfully generated {len(obstacles)} cylindrical obstacle templates (Genesis will copy to {n_envs * len(obstacles)} total)")
-    print(f"  World bounds: x[{world_bounds[0]}, {world_bounds[1]}], y[{world_bounds[2]}, {world_bounds[3]}]")
-    print(f"  Obstacle radius range: {min_radius:.2f} - {max_radius:.2f}")
-    print(f"  Obstacle height range: {min_height:.2f} - {max_height:.2f}")
-    print(f"  Minimum spacing: {min_distance:.2f}")
-
-    return terrain, obstacles
+    return obstacles
 
 
 class NavEnv:

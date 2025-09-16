@@ -4,7 +4,6 @@ import math
 import copy
 import yaml
 import genesis as gs
-from quadcopter_controller import DronePIDController
 from pid import PIDcontroller
 from odom import Odom
 from genesis.utils.geom import (
@@ -17,6 +16,82 @@ from genesis.utils.geom import (
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
 
+def setup_random_cylindrical_obstacles(scene, n_obstacles=20, n_envs=1, min_radius=0.1, max_radius=0.5,
+                                     min_height=1.0, max_height=2.0, min_distance=1.0,
+                                     world_bounds=(-10, 10, -10, 10), device="cpu", oversample_factor=10):
+    """Randomly generates and places non-overlapping cylindrical obstacles in a scene.
+
+    This function uses a batched tensor sampling approach to create a specified number of
+    cylindrical obstacles. It employs an oversampling strategy to generate more candidates
+    than needed, then filters them to ensure they are within world bounds and do not
+    collide with each other, maintaining a minimum distance between them.
+
+    Returns:
+        list: A list of the created gs.Entity obstacle objects.
+    """
+
+    # Oversample candidates (more than needed)
+    n_candidates = n_obstacles * oversample_factor
+    xs = torch.empty(n_candidates, device=device).uniform_(world_bounds[0], world_bounds[1])
+    ys = torch.empty(n_candidates, device=device).uniform_(world_bounds[2], world_bounds[3])
+    radii = torch.empty(n_candidates, device=device).uniform_(min_radius, max_radius)
+    heights = torch.empty(n_candidates, device=device).uniform_(min_height, max_height)
+
+    # ! ---------------- filter by world bounds ----------------------------------------
+    in_bounds = (
+        (xs - radii >= world_bounds[0]) &
+        (xs + radii <= world_bounds[1]) &
+        (ys - radii >= world_bounds[2]) &
+        (ys + radii <= world_bounds[3])
+    )
+
+    xs, ys, radii, heights = xs[in_bounds], ys[in_bounds], radii[in_bounds], heights[in_bounds]
+
+    # ! ---------------- filter by min distance ----------------------------------------
+    obstacles = []
+    obstacle_positions = []
+    obstacle_radii = []
+
+    for i in range(xs.shape[0]):
+        if len(obstacles) >= n_obstacles:
+            break
+        x, y, r, h = xs[i].item(), ys[i].item(), radii[i].item(), heights[i].item()
+
+        if obstacle_positions:
+            pos_tensor = torch.tensor(obstacle_positions, device=device)
+            rad_tensor = torch.tensor(obstacle_radii, device=device)
+            dx = pos_tensor[:, 0] - x
+            dy = pos_tensor[:, 1] - y
+            dist = torch.sqrt(dx**2 + dy**2)
+            if torch.any(dist < (rad_tensor + r + min_distance)):
+                continue  # too close, skip
+
+        # Add obstacle
+        r_color = torch.empty(1, device=device).uniform_(0.3, 0.8).item()
+        g_color = torch.empty(1, device=device).uniform_(0.3, 0.8).item()
+        b_color = torch.empty(1, device=device).uniform_(0.3, 0.8).item()
+
+        obstacle = scene.add_entity(
+            gs.morphs.Cylinder(
+                radius=r,
+                height=h,
+                pos=(x, y, h/2),
+                fixed=True
+            ),
+            surface=gs.surfaces.Rough(
+                diffuse_texture=gs.textures.ColorTexture(
+                    color=(r_color, g_color, b_color),
+                ),
+            ),
+        )
+        obstacles.append(obstacle)
+        obstacle_positions.append((x, y))
+        obstacle_radii.append(r)
+
+    if len(obstacles) < n_obstacles:
+        print(f"Warning: Only generated {len(obstacles)} obstacles (requested {n_obstacles})")
+
+    return obstacles
 
 class TrackerEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False):
@@ -153,7 +228,16 @@ class TrackerEnv:
         )
 
     def step(self, actions):
-        
+        """
+        Steps the environment forward by one time step.
+
+        This function is responsible for updating the state of the environment based on the provided actions.
+        It handles the application of actions, collision detection, loss detection, and updating of various buffers.
+
+        Args:
+            actions (torch.Tensor): The actions to be applied to the environment.
+        """
+        # ! -------------------------- apply actions --------------------------
         self.actions = actions
         exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
     
@@ -166,15 +250,13 @@ class TrackerEnv:
 
         self.scene.step()
 
-        # update buffers
+        # ! -------------------------- update buffers --------------------------
         self.episode_length_buf += 1
         self.tracker_last_pos[:] = self.tracker_pos[:]
         self.tracker_pos[:] = self.tracker.get_pos()
 
-
         self.target_last_pos[:] = self.target_pos[:]
         self.target_pos[:] = self.target.get_pos()
-
 
         self.rel_pos = self.target_pos - self.tracker_pos
 
@@ -183,10 +265,8 @@ class TrackerEnv:
             transform_quat_by_quat(
                 torch.ones_like(self.tracker_quat) * self.tracker_inv_init_quat,
                 self.tracker_quat,
-            ),
-            rpy=True,
-            degrees=True,
-        )
+            ), rpy=True, degrees=True)
+        
         inv_tracker_quat = inv_quat(self.tracker_quat)
         self.tracker_lin_vel[:] = transform_by_quat(self.tracker.get_vel(), inv_tracker_quat)
         self.tracker_ang_vel[:] = transform_by_quat(self.tracker.get_ang(), inv_tracker_quat)
@@ -196,10 +276,8 @@ class TrackerEnv:
             transform_quat_by_quat(
                 torch.ones_like(self.target_quat) * self.target_inv_init_quat,
                 self.target_quat,
-            ),
-            rpy=True,
-            degrees=True,
-        )
+            ), rpy=True, degrees=True)
+        
         inv_target_quat = inv_quat(self.target_quat)
         self.target_lin_vel[:] = transform_by_quat(self.target.get_vel(), inv_target_quat)
         self.target_ang_vel[:] = transform_by_quat(self.target.get_ang(), inv_target_quat)
@@ -209,6 +287,7 @@ class TrackerEnv:
         # 1. 无人机发生碰撞
         # 2. 目标无人机丢失
         
+        # ! -------------------------- check termination and reset --------------------------
         collision_flag = self._collision_detect()
 
         loss_flag = self._loss_detect()
@@ -231,7 +310,7 @@ class TrackerEnv:
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1,)))
 
-        # compute reward
+        # ! -------------------------- compute reward --------------------------
         self.rew_buf[:] = 0.0
         for name, reward_func in self.reward_functions.items():
             rew = reward_func() * self.reward_scales[name]
@@ -239,20 +318,19 @@ class TrackerEnv:
             self.episode_sums[name] += rew
             # print(f"{name} reward: {rew.mean().item():.3f}")
 
-        # compute observations
+        # ! -------------------------- compute observations --------------------------
         self.obs_buf = torch.cat(
             [
-                torch.clip(self.rel_pos * self.obs_scales["max_diff"], -1, 1),
-                self.tracker_quat,
-                # 新增：追踪者自身的线速度和角速度
-                torch.clip(self.tracker_lin_vel * self.obs_scales["max_lin"], -1, 1),
-                torch.clip(self.tracker_ang_vel * self.obs_scales["max_ang"], -1, 1),
-                # 目标的速度
-                torch.clip(self.target_lin_vel * self.obs_scales["max_lin"], -1, 1),
-                torch.clip(self.last_actions * self.obs_scales["max_lin"], -1, 1)
+                torch.clip(self.rel_pos * self.obs_scales["max_diff"], -1, 1),          # relative position
+                self.tracker_quat,                                                      # tracker quaternion
+                torch.clip(self.tracker_lin_vel * self.obs_scales["max_lin"], -1, 1),   # tracker linear velocity
+                torch.clip(self.tracker_ang_vel * self.obs_scales["max_ang"], -1, 1),   # tracker angular velocity
+                torch.clip(self.target_lin_vel * self.obs_scales["max_lin"], -1, 1),    # target linear velocity
+                torch.clip(self.last_actions * self.obs_scales["max_lin"], -1, 1),      # last action
             ],
             axis=-1,
         )
+
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
 
@@ -266,12 +344,23 @@ class TrackerEnv:
         return None
 
     def reset_idx(self, envs_idx):
+        """
+        Resets the specified environments to their initial states.
+
+        This function is called to reset a subset of environments identified by `envs_idx`.
+        It handles the resetting of the tracker and target drones' states, including their
+        positions, orientations, and velocities. For the target, it also randomizes the
+        parameters of its circular trajectory for the new episode.
+
+        Args:
+            envs_idx (list or torch.Tensor): The indices of the environments to reset.
+        """
         if len(envs_idx) == 0:
             return
 
         num_resets = len(envs_idx)
 
-        # 重置追踪器 (tracker)
+        # ! -------------------------- reset tracker --------------------------
         self.tracker_pos[envs_idx] = self.tracker_init_pos
         self.tracker_last_pos[envs_idx] = self.tracker_init_pos
         self.tracker_quat[envs_idx] = self.tracker_init_quat.repeat(num_resets, 1)
@@ -281,7 +370,7 @@ class TrackerEnv:
         self.tracker_ang_vel[envs_idx] = 0.0
         self.tracker.zero_all_dofs_velocity(envs_idx)
 
-        # 重置目标 (target)
+        # ! -------------------------- reset target --------------------------
         # 随机化圆的参数
         self.circle_radius[envs_idx] = gs_rand_float(2.0, 4.0, (num_resets,), self.device)
         self.target_height[envs_idx] = gs_rand_float(1.0, 2.5, (num_resets,), self.device)
@@ -305,15 +394,15 @@ class TrackerEnv:
         self.target_ang_vel[envs_idx] = 0.0
         self.target.zero_all_dofs_velocity(envs_idx)
         
-        # 重新计算相对位置
+        # ! -------------------------- reset relative position --------------------------
         self.rel_pos[envs_idx] = self.target_pos[envs_idx] - self.tracker_pos[envs_idx]
 
-        # 重置缓冲区
+        # ! -------------------------- reset buffers ------------------------------------
         self.last_actions[envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
 
-        # 填充额外信息
+        # ! -------------------------- set extras ------------------------------------
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = (
@@ -327,19 +416,34 @@ class TrackerEnv:
         return self.obs_buf, None
 
     def _get_circle_traj(self):        
-        # 将步数转换为弧度
+        """
+        Generates a circular trajectory for a target to follow.
+
+        This function calculates the target's next position on a circle with a fixed radius and height.
+        The angle is updated at each time step to create continuous motion along the circular path.
+        """
+
         angle = self.initial_angle + self.episode_length_buf * self.dt * self.circle_omega
         
-        # 计算新位置的x和y坐标
         x = self.circle_radius * torch.cos(angle)
         y = self.circle_radius * torch.sin(angle)
         z = self.target_height * torch.ones_like(x)
         t = torch.zeros_like(x)
 
-        # 返回目标位置张量
         return torch.stack([x, y, z, t], dim=1)
 
     def _setup_imu_and_controller(self, drone, controller_type, config):
+        """
+        Sets up the IMU and controller for the drone.
+
+        This function sets up an odometry (Odom) and a PID controller for a given drone entity.
+        It attaches the created objects as attributes to the drone entity for later access.
+
+        Args:
+            drone: The drone entity for which to set up the IMU and controller.
+            controller_type (str): The type of controller to be used.
+            config (dict): Configuration parameters for the controller.
+        """
         # Setup Odom (IMU) for the drone
         odom = Odom(
             num_envs=self.num_envs,
@@ -359,7 +463,7 @@ class TrackerEnv:
         pid.set_drone(drone)
         setattr(drone, 'controller', pid)
 
-    # -------------------------------------------- reward functions--------------------------------
+    # ! -------------------------------------------- reward functions--------------------------------
     def _reward_target(self):
         target_rew = torch.sum(torch.square(self.last_rel_pos), dim=1) - torch.sum(torch.square(self.rel_pos), dim=1)
         return target_rew
