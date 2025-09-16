@@ -158,7 +158,7 @@ class TrackerEnv:
         exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
     
         tracker_prop_rpms = self.tracker.controller.step(exec_actions)       # [N,4] tensor 
-        self.tracker.set_propellels_rpm(tracker_prop_rpms)                  # 假设 set_propellels_rpm 支持 batched tensor
+        self.tracker.set_propellels_rpm(tracker_prop_rpms)
 
         circle_traj = self._get_circle_traj()
         target_prop_rpms = self.target.controller.step(circle_traj) 
@@ -222,16 +222,6 @@ class TrackerEnv:
                                 | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
                                 | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
                                 )
-        # print("crash_condition shape:", self.crash_condition.shape)
-
-        # self.crash_condition = (
-        #     (torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
-        #     | (torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
-        #     | (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
-        #     | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
-        #     | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
-        #     | (self.base_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
-        # )
 
         self.reset_buf = (self.episode_length_buf > self.max_episode_length) | self.crash_condition
 
@@ -370,8 +360,6 @@ class TrackerEnv:
         setattr(drone, 'controller', pid)
 
     # -------------------------------------------- reward functions--------------------------------
-
-    # ------------------------------------------------------------------------------------------------
     def _reward_target(self):
         target_rew = torch.sum(torch.square(self.last_rel_pos), dim=1) - torch.sum(torch.square(self.rel_pos), dim=1)
         return target_rew
@@ -427,57 +415,64 @@ class TrackerEnv:
         return reward
     
     def _reward_distance_vertical(self):
-        # 获取垂直方向的距离（取绝对值）
+        """
+        对垂直方向的距离进行奖励。
+        垂直距离为0时获得最大奖励1.0，垂直距离增加时奖励递减。
+        """
+        # ! 1. 获取垂直方向的距离（取绝对值）
         vertical_dist = torch.abs(self.rel_pos[:, 2])
         
-        # 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
+        # ! 2. 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
         # sigma控制奖励随距离衰减的速度，可以根据实际需求调整
         sigma = 0.5
         reward = torch.exp(-0.5 * (vertical_dist / sigma)**2)
         
         return reward
 
-    def _reward_yaw_alignment(self):
-        # 追踪者的前向向量 (在世界坐标系下)
-        # 假设机头方向为 body-frame 的 x 轴
-        forward_vec_body = torch.tensor([1.0, 0, 0], device=self.device).expand(self.num_envs, -1)
-        forward_vec_world = transform_by_quat(forward_vec_body, self.tracker_quat)
-
-        # 指向目标的方向向量
-        direction_to_target = self.rel_pos
-        direction_to_target_normalized = direction_to_target / (torch.norm(direction_to_target, dim=-1, keepdim=True) + 1e-6)
-
-        # 计算点积，衡量对准程度。值越大越好。
-        alignment_dot_product = torch.sum(forward_vec_world * direction_to_target_normalized, dim=-1)
-
-        # 奖励值在 [-1, 1] 之间。我们希望它接近 1。
-        return alignment_dot_product
-    
     def _reward_max_speed(self):
         """
         对速度超过物理极限的行为进行惩罚。
         使用指数函数对超速进行强力惩罚。
         """
         # 假设你的无人机线速度存储在 self.tracker_lin_vel 中
-        # 计算线速度的范数（即速度大小）
         speed_norm = torch.norm(self.actions, dim=-1)
 
-        # 定义最大允许速度，例如 5 m/s
-        # 你需要根据你的环境和无人机物理特性来设定这个值
-        max_speed = 2.0
-        
-        # 计算超出最大速度的部分，小于等于0的部分为0
+        # ! 定义最大允许速度，例如 5 m/s
+        max_speed = 5.0
+    
         exceed_speed = torch.clamp(speed_norm - max_speed, min=0.0)
 
-        # 根据公式计算奖励/惩罚
-        # exp(x) 增长非常快，因此这里可以根据你的实际需求调整常数
-        # 这里我们使用一个简单的线性惩罚，更易于控制
-        # 惩罚 = - (超速部分的平方) * 惩罚系数
-        # 这样可以对轻微超速进行轻微惩罚，对严重超速进行强力惩罚
         speed_penalty = (exceed_speed ** 2) * 2.0  # 惩罚系数 2.0
-        
-        # 另一种更接近你提供的公式的实现，但是更难调参
-        # 你提供的公式可能会导致非常大的负奖励，需要谨慎使用
-        # speed_penalty = -torch.exp(exceed_speed + 1) + 1
-        
         return speed_penalty
+
+    def _reward_visibility(self):
+        """
+        计算并奖励无人机朝向与目标运动方向及相对位置的对齐程度。
+        """
+        # 获取追踪无人机在世界坐标系下的朝向向量
+        # 假设无人机机头方向为 body-frame 的 x 轴
+        forward_vec_body = torch.tensor([1.0, 0, 0], device=self.device).expand(self.num_envs, -1)
+        forward_vec_world = transform_by_quat(forward_vec_body, self.tracker_quat)
+
+        # ! 1. 计算第一个奖励项：运动方向对齐
+        # 获取目标无人机在世界坐标系下的运动方向向量
+        target_vel = self.target.get_vel()
+        vel_norm = torch.norm(target_vel, dim=-1, keepdim=True)
+        epsilon = 1e-6
+        target_vel_normalized = target_vel / (vel_norm + epsilon)
+        reward_direction = torch.sum(forward_vec_world * target_vel_normalized, dim=-1)
+
+        # ! 2. 计算第二个奖励项：空间位置朝向对齐
+        # 获取指向目标的方向向量
+        direction_to_target = self.rel_pos
+        pos_norm = torch.norm(direction_to_target, dim=-1, keepdim=True)
+        direction_to_target_normalized = direction_to_target / (pos_norm + epsilon)
+        reward_yaw = torch.sum(forward_vec_world * direction_to_target_normalized, dim=-1)
+
+        # ! 3. 定义权重。你可以根据需要调整这些值。
+        # 例如，如果运动方向的对齐更重要，可以增加 w_direction 的值。
+        w_direction = 0.5
+        w_yaw = 0.5
+        visibility_reward = w_direction * reward_direction + w_yaw * reward_yaw
+        
+        return visibility_reward

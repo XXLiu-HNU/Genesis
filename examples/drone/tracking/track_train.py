@@ -113,10 +113,10 @@ def get_cfgs():
         "reward_scales": {
             "distance_horizontal": 1.0,   # 建议从稍大的值开始
             "distance_vertical": 1.0,     # 建议从稍大的值开始
-            "yaw_alignment": 2,         # 新增：鼓励机头对准目标
-            "smooth": -0.1,              # 惩罚动作抖动
-            "crash": -10.0,                # 给予一个更显著的碰撞惩罚
-            # "max_speed": -0.5,         # 新增： Penalize high speeds
+            "smooth": -0.1,               # 惩罚动作抖动
+            "crash": -20.0,               # 给予一个更显著的碰撞惩罚
+            "max_speed": -0.5,            # Penalize high speeds
+            "visibility": 1,              # 鼓励机头对准目标
         },
     }
 
