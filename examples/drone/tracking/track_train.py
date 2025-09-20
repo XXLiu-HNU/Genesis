@@ -1,7 +1,7 @@
 import argparse
 import os
 import pickle
-import shutil
+import datetime
 from importlib import metadata
 
 try:
@@ -20,7 +20,7 @@ import genesis as gs
 from track_env import TrackerEnv
 
 
-def get_train_cfg(exp_name, max_iterations):
+def get_train_cfg(exp_name, max_iterations, resume, resume_path):
     train_cfg_dict = {
         "algorithm": {
             "class_name": "PPO",
@@ -52,8 +52,8 @@ def get_train_cfg(exp_name, max_iterations):
             "log_interval": 1,
             "max_iterations": max_iterations,
             "record_interval": -1,
-            "resume": False,
-            "resume_path": None,
+            "resume": resume,
+            "resume_path": resume_path,
             "run_name": "",
         },
         "runner_class_name": "OnPolicyRunner",
@@ -98,28 +98,17 @@ def get_cfgs():
             "max_ang": 1 / 3.14159,
         },
     }
-    # reward_cfg = {
-    #     "yaw_lambda": -10.0,
-    #     "reward_scales": {
-    #         "target": 10.0,
-    #         "smooth": -1e-4,
-    #         "yaw": 0.01,
-    #         "angular": -2e-4,
-    #         "crash": -10.0,
-    #     },
-    # }
-    # 在你的配置文件中
+
     reward_cfg = {
         "reward_scales": {
-            "distance_horizontal": 1.0,   # 建议从稍大的值开始
-            "distance_vertical": 1.0,     # 建议从稍大的值开始
-            "smooth": -0.1,               # 惩罚动作抖动
-            "crash": -20.0,               # 给予一个更显著的碰撞惩罚
-            "max_speed": -0.5,            # Penalize high speeds
-            "visibility": 1,              # 鼓励机头对准目标
+            "distance_horizontal": 1.0,
+            "distance_vertical": 1.0,
+            "smooth": -0.1,
+            "crash": -20.0,
+            "max_speed": -0.5,
+            "visibility": 1,
         },
     }
-
 
     return env_cfg, obs_cfg, reward_cfg
 
@@ -130,21 +119,50 @@ def main():
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=8192)
     parser.add_argument("--max_iterations", type=int, default=301)
+
+    # 新增参数
+    parser.add_argument("--resume", action="store_true", default=False, help="resume training from checkpoint")
+
+    parser.add_argument("--run_time", type=str, default="", help="path to run data directory (e.g., logs/drone-hovering/20230824-152345)")
+
+    parser.add_argument("--ckpt", type=int, default=-1, help="checkpoint number to resume from (e.g., 300)")
+
     args = parser.parse_args()
 
     gs.init(logging_level="warning")
 
-    log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg = get_cfgs()
-    train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
+    base_log_dir = f"logs/{args.exp_name}"
 
-    if os.path.exists(log_dir):
-        shutil.rmtree(log_dir)
+    if args.resume:
+        if args.run_time:
+            log_dir = os.path.join(base_log_dir, args.run_time)
+        else:
+            # 自动获取最新时间戳目录
+            runs = [d for d in os.listdir(base_log_dir) if os.path.isdir(os.path.join(base_log_dir, d))]
+            if not runs:
+                raise RuntimeError(f"No previous runs found in {base_log_dir}")
+            latest_run = sorted(runs)[-1]  # 按名字排序，取最新
+            log_dir = os.path.join(base_log_dir, latest_run)
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir = os.path.join(base_log_dir, timestamp)
+
+
     os.makedirs(log_dir, exist_ok=True)
+
+    env_cfg, obs_cfg, reward_cfg = get_cfgs()
+
+    # 确定 resume_path
+    resume_path = None
+    if args.resume and args.ckpt > 0:
+        resume_path = f"{log_dir}/model_{args.ckpt}.pt"
+
+    train_cfg = get_train_cfg(args.exp_name, args.max_iterations, args.resume, resume_path)
 
     if args.vis:
         env_cfg["visualize_target"] = True
 
+    # 保存 cfgs
     pickle.dump(
         [env_cfg, obs_cfg, reward_cfg, train_cfg],
         open(f"{log_dir}/cfgs.pkl", "wb"),
@@ -159,14 +177,12 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    if args.resume and args.ckpt is not None:
+        runner.load(resume_path, load_optimizer=True)
+        runner.current_learning_iteration = runner.current_learning_iteration  + 1 # 
 
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 
 
 if __name__ == "__main__":
     main()
-
-"""
-# training
-python examples/drone/hover_train.py
-"""
