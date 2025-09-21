@@ -26,12 +26,25 @@ def main():
     parser.add_argument("-e", "--exp_name", type=str, default="drone-hovering")
     parser.add_argument("--ckpt", type=int, default=300)
     parser.add_argument("--record", action="store_true", default=False)
+    parser.add_argument("--run_time", type=str, default=None)   
     args = parser.parse_args()
 
     gs.init()
 
-    log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, train_cfg = pickle.load(open(f"logs/{args.exp_name}/cfgs.pkl", "rb"))
+    # log_dir = f"logs/{args.exp_name}"
+    base_log_dir = f"logs/{args.exp_name}"
+
+    if args.run_time:
+        log_dir = os.path.join(base_log_dir, args.run_time)
+    else:
+        # 自动获取最新时间戳目录
+        runs = [d for d in os.listdir(base_log_dir) if os.path.isdir(os.path.join(base_log_dir, d))]
+        if not runs:
+            raise RuntimeError(f"No previous runs found in {base_log_dir}")
+        latest_run = sorted(runs)[-1]  # 按名字排序，取最新
+        log_dir = os.path.join(base_log_dir, latest_run)
+
+    env_cfg, obs_cfg, reward_cfg, train_cfg = pickle.load(open(os.path.join(log_dir, "cfgs.pkl"), "rb"))
     reward_cfg["reward_scales"] = {}
 
     # visualize the target
