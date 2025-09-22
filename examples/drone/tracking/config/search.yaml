@@ -1,0 +1,41 @@
+world:
+  xy_min: [-10.0, -10.0]        # 世界边界（x_min, y_min）
+  xy_max: [ 10.0,  10.0]        # 世界边界（x_max, y_max）
+  grid_cell: 0.10               # A* 占据栅格的分辨率，越小越细，计算更慢
+  extra_grid_margin_default: 0.02  # 栅格级膨胀默认值（米），相当于在障碍外再退一圈
+  extra_grid_margin_min: 0.00      # 允许膨胀减小到的最小值（逐步放宽时用）
+
+drone:
+  height: 1.0                   # 无人机飞行高度（z 恒定）
+  radius: 0.12                  # 无人机在水平面的等效半径（机臂长度）
+
+safety:
+  margin: 0.12                  # 额外安全余量（与障碍保持距离）
+
+follower:                        # 路径跟随器参数
+  v_max: 0.6                     # 最大巡航速度
+  a_max: 1.2                     # 最大加速度
+  warmup_time: 2.5               # 从 v_init 线性加速到 v_max 所需时间（秒）
+  v_init: 0.08                   # 初始速度上限（防止刚开始加速过猛）
+  lookahead_time: 0.5            # 前瞻时间（秒），决定参考点超前多少
+  min_lookahead: 0.12            # 最小前瞻距离（米），避免低速时过近
+  goal_reach_thresh: 0.12        # 判断“到达终点”的阈值（弧长剩余距离）
+
+planner:
+  device: cpu                    # 规划计算设备：cpu 或 cuda（推荐 cpu，避免渲染卡顿）
+  max_replan_tries: 8            # 最大重规划尝试轮数（逐步放宽参数）
+  goals_per_try: 5               # 每轮尝试采样多少个目标点
+  grid_cell_max: 0.12            # 放宽到更粗的栅格分辨率上限（最后手段）
+  inflation_min_addon: 0.06      # 最小 inflation = drone.radius + 这个值（米）
+
+replan:
+  cooldown_sec: 1.0              # 重规划冷却时间（秒），避免同一帧多次 replan
+  hold_retry_interval_sec: 2.0   # 悬停多长时间后强制再试一次 replan（秒）
+
+obstacles:
+  n: 100                         # 随机生成的圆柱障碍数量
+
+viewer:                          # 可视化相机配置
+  camera_pos:   [0.0, 0.0, 6.0]  # 相机位置 (x, y, z)
+  camera_lookat: [0.0, 0.0, 1.0] # 相机注视点
+  camera_fov:   80               # 相机视场角 (°)
