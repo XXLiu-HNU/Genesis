@@ -73,6 +73,7 @@ def get_cfgs():
         "termination_if_roll_greater_than": 90,  # degree
         "termination_if_pitch_greater_than": 90,
         "termination_if_close_to_ground": 0.1,
+        "n_obstacles": 0,
         "termination_if_x_greater_than": 10.0,
         "termination_if_y_greater_than": 10.0,
         "termination_if_z_greater_than": 2.5,

@@ -12,86 +12,11 @@ from genesis.utils.geom import (
     inv_quat,
     transform_quat_by_quat,
 )
+from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles
 
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
 
-def setup_random_cylindrical_obstacles(scene, n_obstacles=20, n_envs=1, min_radius=0.1, max_radius=0.5,
-                                     min_height=1.0, max_height=2.0, min_distance=1.0,
-                                     world_bounds=(-10, 10, -10, 10), device="cpu", oversample_factor=10):
-    """Randomly generates and places non-overlapping cylindrical obstacles in a scene.
-
-    This function uses a batched tensor sampling approach to create a specified number of
-    cylindrical obstacles. It employs an oversampling strategy to generate more candidates
-    than needed, then filters them to ensure they are within world bounds and do not
-    collide with each other, maintaining a minimum distance between them.
-
-    Returns:
-        list: A list of the created gs.Entity obstacle objects.
-    """
-
-    # Oversample candidates (more than needed)
-    n_candidates = n_obstacles * oversample_factor
-    xs = torch.empty(n_candidates, device=device).uniform_(world_bounds[0], world_bounds[1])
-    ys = torch.empty(n_candidates, device=device).uniform_(world_bounds[2], world_bounds[3])
-    radii = torch.empty(n_candidates, device=device).uniform_(min_radius, max_radius)
-    heights = torch.empty(n_candidates, device=device).uniform_(min_height, max_height)
-
-    # ! ---------------- filter by world bounds ----------------------------------------
-    in_bounds = (
-        (xs - radii >= world_bounds[0]) &
-        (xs + radii <= world_bounds[1]) &
-        (ys - radii >= world_bounds[2]) &
-        (ys + radii <= world_bounds[3])
-    )
-
-    xs, ys, radii, heights = xs[in_bounds], ys[in_bounds], radii[in_bounds], heights[in_bounds]
-
-    # ! ---------------- filter by min distance ----------------------------------------
-    obstacles = []
-    obstacle_positions = []
-    obstacle_radii = []
-
-    for i in range(xs.shape[0]):
-        if len(obstacles) >= n_obstacles:
-            break
-        x, y, r, h = xs[i].item(), ys[i].item(), radii[i].item(), heights[i].item()
-
-        if obstacle_positions:
-            pos_tensor = torch.tensor(obstacle_positions, device=device)
-            rad_tensor = torch.tensor(obstacle_radii, device=device)
-            dx = pos_tensor[:, 0] - x
-            dy = pos_tensor[:, 1] - y
-            dist = torch.sqrt(dx**2 + dy**2)
-            if torch.any(dist < (rad_tensor + r + min_distance)):
-                continue  # too close, skip
-
-        # Add obstacle
-        r_color = torch.empty(1, device=device).uniform_(0.3, 0.8).item()
-        g_color = torch.empty(1, device=device).uniform_(0.3, 0.8).item()
-        b_color = torch.empty(1, device=device).uniform_(0.3, 0.8).item()
-
-        obstacle = scene.add_entity(
-            gs.morphs.Cylinder(
-                radius=r,
-                height=h,
-                pos=(x, y, h/2),
-                fixed=True
-            ),
-            surface=gs.surfaces.Rough(
-                diffuse_texture=gs.textures.ColorTexture(
-                    color=(r_color, g_color, b_color),
-                ),
-            ),
-        )
-        obstacles.append(obstacle)
-        obstacle_positions.append((x, y))
-        obstacle_radii.append(r)
-
-    if len(obstacles) < n_obstacles:
-        print(f"Warning: Only generated {len(obstacles)} obstacles (requested {n_obstacles})")
-
-    return obstacles
 
 class TrackerEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False):
@@ -114,6 +39,8 @@ class TrackerEnv:
         
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
+
+        self.n_obstacles = env_cfg["n_obstacles"]
 
         # create scene
         self.scene = gs.Scene(
@@ -175,6 +102,10 @@ class TrackerEnv:
         self._setup_imu_and_controller(self.tracker, "rate", self.rate_ctrl_config)
         self._setup_imu_and_controller(self.target, "position", self.pos_ctrl_config)
         
+        # Add obstacles
+        obs, obstacle_positions, obstacle_radii = setup_random_cylindrical_obstacles(self.scene,n_obstacles = self.n_obstacles, device=gs.device)
+        self.obstacle_positions = torch.tensor(obstacle_positions, device=gs.device)
+        self.obstacle_radii = torch.tensor(obstacle_radii, device=gs.device)
         # build scene
         self.scene.build(n_envs=num_envs)
 
@@ -213,12 +144,18 @@ class TrackerEnv:
         self.extras["observations"] = dict()
 
     def _collision_detect(self):
-        # TODO 
-        return False
+        if self.n_obstacles > 0:
+            bool,_ = collision_check(self.tracker_pos, self.obstacle_positions, self.obstacle_radii)
+            return bool
+        else:
+            return False
     
     def _loss_detect(self):
-        # TODO 
-        return False
+        if self.n_obstacles > 0:
+            bool, _, _ = occlusion_check(self.tracker_pos, self.target_pos, self.obstacle_positions, self.obstacle_radii)
+            return bool
+        else:
+            return False
 
     def _at_target(self):
         return (
