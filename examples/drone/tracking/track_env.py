@@ -14,9 +14,14 @@ from genesis.utils.geom import (
 )
 from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles
 
-def gs_rand_float(lower, upper, shape, device):
-    return (upper - lower) * torch.rand(size=shape, device=device) + lower
+from path_search import (
+    sample_free_xy, sample_origin_xy_batch, PathFollower
+)
+from roadmap import Roadmap,_line_of_sight_free
 
+import numpy as np
+
+import time
 
 class TrackerEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False):
@@ -40,16 +45,56 @@ class TrackerEnv:
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
 
-        self.n_obstacles = env_cfg["n_obstacles"]
 
-        # create scene
+        # ! Add target search parms
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(script_dir, "config/search.yaml"), "r") as f:
+            nav_cfg = yaml.safe_load(f)
+
+        def cfg(path, default=None):
+            # 轻量 get：path 形如 "world.xy_min"
+            cur = nav_cfg
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return default
+                cur = cur[k]
+            return cur
+        
+        # 基本参数
+        self.drone_height = float(cfg("drone.height", 1.0))
+        self.world_xy_min = tuple(cfg("world.xy_min", [-10.0, -10.0]))
+        self.world_xy_max = tuple(cfg("world.xy_max", [ 10.0,  10.0]))
+
+        self.drone_radius  = float(cfg("drone.radius", 0.12))
+        self.safety_margin = float(cfg("safety.margin", 0.12))
+
+        # 规划/鲁棒性参数（从 cfg 读取）
+        self.max_replan_tries = int(cfg("planner.max_replan_tries", 8))
+        self.goals_per_try    = int(cfg("planner.goals_per_try", 5))
+
+
+        # inflation：默认 & 最小（派生量）
+        self.inflation_default = self.drone_radius + self.safety_margin
+        self.inflation_min     = self.drone_radius + float(cfg("planner.inflation_min_addon", 0.06))
+        self.inflation         = self.inflation_default  # 当前使用的 inflation，可在重试中调整
+
+        # follower 参数
+        self.v_max          = float(cfg("follower.v_max", 0.6))
+        self.a_max          = float(cfg("follower.a_max", 1.2))
+        self.warmup_time    = float(cfg("follower.warmup_time", 2.5))
+        self.v_init         = float(cfg("follower.v_init", 0.08))
+        self.lookahead_time = float(cfg("follower.lookahead_time", 0.5))
+        self.min_lookahead  = float(cfg("follower.min_lookahead", 0.12))
+        self.goal_reach_thresh = float(cfg("follower.goal_reach_thresh", 0.12))
+
+        # ! Create scene
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
             viewer_options=gs.options.ViewerOptions(
                 max_FPS=env_cfg["max_visualize_FPS"],
-                camera_pos=(3.0, 0.0, 3.0),
+                camera_pos=(0.0, 0.0, 8.0),
                 camera_lookat=(0.0, 0.0, 1.0),
-                camera_fov=40,
+                camera_fov=80,
             ),
             vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(self.rendered_env_num))),  
             rigid_options=gs.options.RigidOptions(
@@ -62,10 +107,10 @@ class TrackerEnv:
             profiling_options=gs.options.ProfilingOptions(show_FPS=False)
         )
 
-        # add plane
+        # ! Add plane
         self.scene.add_entity(gs.morphs.Plane())
 
-        # add camera
+        # !Add camera
         if self.env_cfg["visualize_camera"]:
             self.cam = self.scene.add_camera(
                 res=(640, 480),
@@ -75,19 +120,13 @@ class TrackerEnv:
                 GUI=True,
             )
 
-        # Add Tracker
+        # ! Add Tracker
         self.tracker_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
         self.tracker_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.tracker_inv_init_quat = inv_quat(self.tracker_init_quat)
         self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
 
-        # Add Traget
-        self.circle_radius = torch.ones(self.num_envs, device=self.device)
-        self.target_height = torch.ones(self.num_envs, device=self.device)
-        self.circle_omega = torch.ones(self.num_envs, device=self.device)
-        self.circle_center = torch.tensor([0.0, 0.0, 1.0], device=self.device) 
-
-        self.target_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
+        # ! Add Traget
         self.target_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.target_inv_init_quat = inv_quat(self.target_init_quat)
         self.target = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
@@ -98,25 +137,68 @@ class TrackerEnv:
         with open(os.path.join(script_dir, "config/rate.yaml"), "r") as file:
                 self.rate_ctrl_config = yaml.load(file, Loader=yaml.FullLoader)
 
-        # Add odom and controller for drone
+        # ! Add odom and controller for drone
         self._setup_imu_and_controller(self.tracker, "rate", self.rate_ctrl_config)
         self._setup_imu_and_controller(self.target, "position", self.pos_ctrl_config)
         
-        # Add obstacles
-        obs, obstacle_positions, obstacle_radii = setup_random_cylindrical_obstacles(self.scene,n_obstacles = self.n_obstacles, device=gs.device)
-        self.obstacle_positions = torch.tensor(obstacle_positions, device=gs.device)
-        self.obstacle_radii = torch.tensor(obstacle_radii, device=gs.device)
-        # build scene
+        # ! Add obstacles
+        self.n_obstacles = int(cfg("obstacles.n", 100))
+        world_bounds_xyxy = (
+            self.world_xy_min[0], self.world_xy_max[0],
+            self.world_xy_min[1], self.world_xy_max[1],
+        )
+        obs, obs_xy, obs_r = setup_random_cylindrical_obstacles(self.scene, n_obstacles=self.n_obstacles, world_bounds=world_bounds_xyxy,origin_clearance = 3.0, min_distance = 2.0)
+
+        self.obs_xy = torch.tensor(obs_xy, dtype=torch.float32, device=self.device) if len(obs_xy) > 0 else torch.zeros((0,2), dtype=torch.float32, device=self.device)
+        self.obs_r  = torch.tensor(obs_r , dtype=torch.float32, device=self.device) if len(obs_r ) > 0 else torch.zeros((0,),  dtype=torch.float32, device=self.device)
+        
+        # ! Build scene
         self.scene.build(n_envs=num_envs)
 
-        # prepare reward functions and multiply reward scales by dt
+
+        # 先把 obstacle/边界搬到 CPU numpy，避免重复 to('cpu')
+        self.obs_xy_cpu_np = self.obs_xy.detach().to("cpu", copy=True).numpy().astype(np.float32)
+        self.obs_r_cpu_np  = self.obs_r.detach().to("cpu", copy=True).numpy().astype(np.float32)
+
+        # ===== 引入 Roadmap =====
+
+        # 参数可按场景微调
+        self.prm_num_nodes   = 1500
+        self.prm_k_neighbors = 12
+        self.prm_max_edge    = 2.5
+        self.prm_clearance   = self.inflation_default
+
+        self.roadmap = Roadmap.build(
+            world_min=(float(self.world_xy_min[0]), float(self.world_xy_min[1])),
+            world_max=(float(self.world_xy_max[0]), float(self.world_xy_max[1])),
+            obs_xy=self.obs_xy_cpu_np,
+            obs_r=self.obs_r_cpu_np,
+            n_nodes=self.prm_num_nodes,
+            k=self.prm_k_neighbors,
+            max_edge_len=self.prm_max_edge,
+            clearance=self.prm_clearance,
+        )
+
+        # ! Add for path searching
+        self.goal_xy = [None] * self.num_envs
+        self.path_wps = [None] * self.num_envs
+        self.followers = [None] * self.num_envs
+
+        from collections import deque
+
+        self.replan_queue = deque()   # FIFO 队列存 env_id
+        self.replan_inqueue = set()   # 去重
+        self.max_plan_per_step = 32   # 每帧最多处理的规划请求数（可调/自适应）
+
+
+        # ! Prepare reward functions and multiply reward scales by dt
         self.reward_functions, self.episode_sums = dict(), dict()
         for name in self.reward_scales.keys():
             self.reward_scales[name] *= self.dt
             self.reward_functions[name] = getattr(self, "_reward_" + name)
             self.episode_sums[name] = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
-        # initialize buffers
+        # ! Initialize buffers
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=gs.device, dtype=gs.tc_float)
         self.rew_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
@@ -143,26 +225,97 @@ class TrackerEnv:
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
 
+    def plan_new_mission(self, envs_idx):
+        """
+        为指定的 envs 重新规划 target 的轨迹
+        """
+        # 统一把 envs_idx 变成 Python 列表
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.tolist()
+        elif not isinstance(envs_idx, (list, tuple)):
+            envs_idx = [int(envs_idx)]
+
+        with torch.no_grad():
+
+            for env_id in envs_idx:
+                # 当前起点（世界坐标）
+                cur = self.target.get_pos()[env_id]
+                start_xy = (cur[0].item(), cur[1].item())
+
+                path_found, chosen_goal, chosen_path = False, None, None
+
+                # 逐步放宽（注意：使用 cached 网格时，放宽参数不会改变已缓存网格，仅改变采样与重试策略）
+                for attempt in range(self.max_replan_tries):
+                    # 多采几个目标点以增加成功率
+                    goals_xy = []
+                    for _ in range(self.goals_per_try):
+                        g = sample_free_xy(
+                            self.world_xy_min, self.world_xy_max,
+                            self.obs_xy, self.obs_r,
+                            safe_radius=self.prm_clearance,
+                            device=self.device
+                        )
+                        if isinstance(g, torch.Tensor):
+                            g = (float(g[0].item()), float(g[1].item()))
+                        goals_xy.append(g)
+
+                    # 一次性查询（命中任一目标即返回路径）
+                    path_np = self.roadmap.query(start_xy, goals_xy, k_attach=8)
+                    if path_np is not None and path_np.shape[0] >= 2:
+                        chosen_path = [(float(x), float(y)) for (x, y) in path_np.tolist()]
+                        chosen_goal = chosen_path[-1]
+                        path_found = True
+                        break
+
+                if path_found:
+                    # 成功：写回该 env 的目标与路径
+                    self.goal_xy[env_id]  = chosen_goal
+                    self.path_wps[env_id] = chosen_path
+
+                    # follower：按 env 独立创建/重置
+                    if self.followers[env_id] is None:
+                        self.followers[env_id] = PathFollower(
+                            chosen_path, self.dt,
+                            v_max=self.v_max, a_max=self.a_max,
+                            warmup_time=self.warmup_time, v_init=self.v_init,
+                            lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
+                            slow_down_k=1.2
+                        )
+                    else:
+                        self.followers[env_id].reset_with_path(chosen_path)
+
+                else:
+                    # 失败：不要 raise，悬停 + 下次再试
+                    print(f"[Planner] WARNING: env {env_id} no path found, holding position.")
+                    hold_xy = start_xy
+                    self.goal_xy[env_id]  = hold_xy
+                    self.path_wps[env_id] = [hold_xy, hold_xy]
+
+                    if self.followers[env_id] is None:
+                        self.followers[env_id] = PathFollower(
+                            self.path_wps[env_id], self.dt,
+                            v_max=self.v_max, a_max=self.a_max,
+                            warmup_time=self.warmup_time, v_init=self.v_init,
+                            lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
+                            slow_down_k=1.2
+                        )
+                    else:
+                        self.followers[env_id].reset_with_path(self.path_wps[env_id])
+
     def _collision_detect(self):
         if self.n_obstacles > 0:
-            bool,_ = collision_check(self.tracker_pos, self.obstacle_positions, self.obstacle_radii)
+            bool,_ = collision_check(self.tracker_pos, self.obs_xy, self.obs_r)
             return bool
         else:
             return False
     
     def _loss_detect(self):
         if self.n_obstacles > 0:
-            bool, _, _ = occlusion_check(self.tracker_pos, self.target_pos, self.obstacle_positions, self.obstacle_radii)
+            bool, _, _ = occlusion_check(self.tracker_pos, self.target_pos, self.obs_xy, self.obs_r)
             return bool
         else:
             return False
 
-    def _at_target(self):
-        return (
-            (torch.norm(self.rel_pos, dim=1) < self.env_cfg["at_target_threshold"])
-            .nonzero(as_tuple=False)
-            .reshape((-1,))
-        )
 
     def step(self, actions):
         """
@@ -177,12 +330,48 @@ class TrackerEnv:
         # ! -------------------------- apply actions --------------------------
         self.actions = actions
         exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
-    
+
+        # 
         tracker_prop_rpms = self.tracker.controller.step(exec_actions)       # [N,4] tensor 
         self.tracker.set_propellels_rpm(tracker_prop_rpms)
 
-        circle_traj = self._get_circle_traj()
-        target_prop_rpms = self.target.controller.step(circle_traj) 
+        cur_pos = self.target.get_pos()   # shape [num_envs, 3]
+        cur_xy = cur_pos[:, :2]           # (N,2)
+        ref_pos = torch.zeros((self.num_envs, 4), device=self.device)
+        
+        ref_pos[:, 2] = self.drone_height   # 一次性填好 z
+        ref_pos[:, 3] = 0.0                 # 一次性填好 yaw
+
+
+        # 1) 收集有路径跟随器的 env 索引，避免每次属性访问
+        has_follower = [i for i in range(self.num_envs) if self.followers[i] is not None]
+        M = len(has_follower)
+
+        if M > 0:
+            # 2) 批量调用 step（不传 cur_xy；也不构造 tuple）
+            next_list = [self.followers[i].step() for i in has_follower]   # List[(x,y)]
+
+            # 3) 一次性写回 ref_pos 的 x,y（避免每步两次标量赋值）
+            next_xy = torch.tensor(next_list, device=self.device, dtype=gs.tc_float)
+            idx = torch.tensor(has_follower, device=self.device, dtype=torch.long)
+            ref_pos.index_copy_(0, idx, torch.cat([next_xy, torch.full((M,2), 0.0, device=self.device, dtype=gs.tc_float)], dim=1))
+
+            # 4) 批量判断 reached_goal，再少量 Python 入队（通常只有极少数 true）
+            reached = [i for i in has_follower if self.followers[i].reached_goal(thresh=self.goal_reach_thresh)]
+            for env_id in reached:
+                if env_id not in self.replan_inqueue:
+                    self.replan_queue.append(env_id)
+                    self.replan_inqueue.add(env_id)
+
+        # 5) 没有 follower 的 env：原地（向量化处理）
+        no_follower_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        if M > 0:
+            no_follower_mask[idx] = False
+        if no_follower_mask.any():
+            ref_pos[no_follower_mask, :3] = cur_pos[no_follower_mask]
+            ref_pos[no_follower_mask, 3]  = 0.0
+
+        target_prop_rpms = self.target.controller.step(ref_pos)
         self.target.set_propellels_rpm(target_prop_rpms)
 
         self.scene.step()
@@ -271,6 +460,7 @@ class TrackerEnv:
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
 
+        self._drain_replan_queue()
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
@@ -308,19 +498,15 @@ class TrackerEnv:
         self.tracker.zero_all_dofs_velocity(envs_idx)
 
         # ! -------------------------- reset target --------------------------
-        # 随机化圆的参数
-        self.circle_radius[envs_idx] = gs_rand_float(2.0, 4.0, (num_resets,), self.device)
-        self.target_height[envs_idx] = gs_rand_float(1.0, 2.5, (num_resets,), self.device)
-        self.circle_omega[envs_idx] = gs_rand_float(0.5, 1.0, (num_resets,), self.device)
-        
-        # 随机化初始角度
-        self.initial_angle[envs_idx] = gs_rand_float(0, 2 * math.pi, (num_resets,), self.device)
-        
-        # 计算新的起始位置
+        # 批量采样起点
+        start_xys = sample_origin_xy_batch(num_resets, r_min=2.0, r_max=2.5,
+                                        center=(0.0,0.0), device=self.device)  # (num_resets,2)
+
+        # 构造新的起始位置 (num_resets,3)
         new_target_pos = torch.zeros((num_resets, 3), device=self.device)
-        new_target_pos[:, 0] = self.circle_center[0] + self.circle_radius[envs_idx] * torch.cos(self.initial_angle[envs_idx])
-        new_target_pos[:, 1] = self.circle_center[1] + self.circle_radius[envs_idx] * torch.sin(self.initial_angle[envs_idx])
-        new_target_pos[:, 2] = self.target_height[envs_idx]
+        new_target_pos[:, 0] = start_xys[:, 0]
+        new_target_pos[:, 1] = start_xys[:, 1]
+        new_target_pos[:, 2] = self.drone_height
         
         self.target_pos[envs_idx] = new_target_pos
         self.target_last_pos[envs_idx] = new_target_pos
@@ -347,28 +533,104 @@ class TrackerEnv:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
+        for eid in envs_idx:
+            if int(eid) not in self.replan_inqueue:
+                self.replan_queue.append(int(eid))
+                self.replan_inqueue.add(int(eid))
+
+
     def reset(self):
         self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         return self.obs_buf, None
 
-    def _get_circle_traj(self):        
-        """
-        Generates a circular trajectory for a target to follow.
+    def _drain_replan_queue(self, budget=None):
+        """每帧消化最多 budget 个规划请求"""
+        if budget is None:
+            budget = self.max_plan_per_step
 
-        This function calculates the target's next position on a circle with a fixed radius and height.
-        The angle is updated at each time step to create continuous motion along the circular path.
-        """
+        batch = []
+        while budget > 0 and self.replan_queue:
+            eid = self.replan_queue.popleft()
+            if eid in self.replan_inqueue:
+                self.replan_inqueue.remove(eid)
+            batch.append(eid)
+            budget -= 1
 
-        angle = self.initial_angle + self.episode_length_buf * self.dt * self.circle_omega
-        
-        x = self.circle_radius * torch.cos(angle)
-        y = self.circle_radius * torch.sin(angle)
-        z = self.target_height * torch.ones_like(x)
-        t = torch.zeros_like(x)
+        if batch:
+            # 用你已经实现的批量规划（或 roadmap.query 逐个）
+            self.plan_new_mission_batch(batch, max_plan_per_step=len(batch))
 
-        return torch.stack([x, y, z, t], dim=1)
+    def plan_new_mission_batch(self, envs_idx, max_plan_per_step=16):
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.tolist()
+        elif not isinstance(envs_idx, (list, tuple)):
+            envs_idx = [int(envs_idx)]
+        if len(envs_idx) == 0:
+            return
 
+        # 节流：每步只处理部分 env，避免突刺
+        envs_idx = envs_idx[:max_plan_per_step]
+
+        # 1) 批量取起点
+        cur_pos = self.target.get_pos()   # [N,3]
+        starts_xy = [(float(cur_pos[i,0].item()), float(cur_pos[i,1].item())) for i in envs_idx]
+
+        # 2) 为这一批 env 共享一套候选目标（减少采样 & KNN 次数）
+        goals_xy_shared = []
+        for _ in range(max(8, self.goals_per_try)):  # 稍微多采一点，共享
+            g = sample_free_xy(self.world_xy_min, self.world_xy_max,
+                            self.obs_xy, self.obs_r,
+                            safe_radius=self.prm_clearance, device=self.device)
+            if isinstance(g, torch.Tensor):
+                g = (float(g[0].item()), float(g[1].item()))
+            goals_xy_shared.append(g)
+
+        # 3) 逐起点跑一次 query（但共享目标 & KNN 索引）
+        for idx, env_id in enumerate(envs_idx):
+            start_xy = starts_xy[idx]
+            chosen_path = None
+            # 先试直线可达（批量目标里命中概率很高）
+            los_hits = [g for g in goals_xy_shared
+                        if _line_of_sight_free(
+                            np.asarray(start_xy, np.float32),
+                            np.asarray(g, np.float32),
+                            self.roadmap.obs_xy, self.roadmap.obs_r, self.roadmap.clearance)]
+            if len(los_hits) > 0:
+                chosen_path = np.asarray([start_xy, los_hits[0]], dtype=np.float32)
+            else:
+                # 再 PRM 查询
+                chosen_path = self.roadmap.query(start_xy, goals_xy_shared, k_attach=8)
+
+            if chosen_path is not None and chosen_path.shape[0] >= 2:
+                path_list = [(float(x), float(y)) for (x, y) in chosen_path.tolist()]
+                self.goal_xy[env_id]  = path_list[-1]
+                self.path_wps[env_id] = path_list
+                if self.followers[env_id] is None:
+                    self.followers[env_id] = PathFollower(
+                        self.path_wps[env_id], self.dt,
+                        v_max=self.v_max, a_max=self.a_max,
+                        warmup_time=self.warmup_time, v_init=self.v_init,
+                        lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
+                        slow_down_k=1.2
+                    )
+                else:
+                    self.followers[env_id].reset_with_path(self.path_wps[env_id])
+            else:
+                # 兜底：悬停
+                hold_xy = start_xy
+                self.goal_xy[env_id]  = hold_xy
+                self.path_wps[env_id] = [hold_xy, hold_xy]
+                if self.followers[env_id] is None:
+                    self.followers[env_id] = PathFollower(
+                        self.path_wps[env_id], self.dt,
+                        v_max=self.v_max, a_max=self.a_max,
+                        warmup_time=self.warmup_time, v_init=self.v_init,
+                        lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
+                        slow_down_k=1.2
+                    )
+                else:
+                    self.followers[env_id].reset_with_path(self.path_wps[env_id])
     def _setup_imu_and_controller(self, drone, controller_type, config):
         """
         Sets up the IMU and controller for the drone.

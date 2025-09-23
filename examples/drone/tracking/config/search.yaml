@@ -1,8 +1,8 @@
 world:
-  xy_min: [-10.0, -10.0]        # 世界边界（x_min, y_min）
-  xy_max: [ 10.0,  10.0]        # 世界边界（x_max, y_max）
-  grid_cell: 0.10               # A* 占据栅格的分辨率，越小越细，计算更慢
-  extra_grid_margin_default: 0.02  # 栅格级膨胀默认值（米），相当于在障碍外再退一圈
+  xy_min: [-8.0, -8.0]        # 世界边界（x_min, y_min）
+  xy_max: [ 8.0,  8.0]        # 世界边界（x_max, y_max）
+  grid_cell: 0.20               # A* 占据栅格的分辨率，越小越细，计算更慢
+  extra_grid_margin_default: 0.05  # 栅格级膨胀默认值（米），相当于在障碍外再退一圈
   extra_grid_margin_min: 0.00      # 允许膨胀减小到的最小值（逐步放宽时用）
 
 drone:
@@ -33,7 +33,7 @@ replan:
   hold_retry_interval_sec: 2.0   # 悬停多长时间后强制再试一次 replan（秒）
 
 obstacles:
-  n: 100                         # 随机生成的圆柱障碍数量
+  n: 20                          # 随机生成的圆柱障碍数量
 
 viewer:                          # 可视化相机配置
   camera_pos:   [0.0, 0.0, 6.0]  # 相机位置 (x, y, z)

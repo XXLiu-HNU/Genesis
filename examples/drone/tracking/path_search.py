@@ -78,6 +78,40 @@ def sample_free_xy(
             return x, y
     raise RuntimeError("sample_free_xy: failed to find a collision-free sample.")
 
+def sample_origin_xy(
+    r_min: float = 2.0,
+    r_max: float = 3.0,
+    center: Tuple[float, float] = (0.0, 0.0),
+) -> Tuple[float, float]:
+    """
+    在以 center 为圆心的 [r_min, r_max] 环形区域内随机采样一个点。
+    假设该区域已经没有障碍。
+    """
+    # 面积均匀的环形采样
+    u = random.random()
+    rho = math.sqrt(u * (r_max * r_max - r_min * r_min) + r_min * r_min)
+    theta = random.random() * 2.0 * math.pi
+    x = center[0] + rho * math.cos(theta)
+    y = center[1] + rho * math.sin(theta)
+    return x, y
+
+def sample_origin_xy_batch(
+    n: int,
+    r_min: float = 2.0,
+    r_max: float = 3.0,
+    center=(0.0, 0.0),
+    device="cpu"
+) -> torch.Tensor:
+    """
+    批量采样 n 个起点，返回形状 (n,2) 的张量。
+    """
+    u = torch.rand(n, device=device)
+    rho = torch.sqrt(u * (r_max**2 - r_min**2) + r_min**2)
+    theta = 2.0 * math.pi * torch.rand(n, device=device)
+    x = center[0] + rho * torch.cos(theta)
+    y = center[1] + rho * torch.sin(theta)
+    return torch.stack([x, y], dim=1)  # (n,2)
+
 def world_to_grid(
     x: float, y: float, world_xy_min: Tuple[float, float], cell: float, W: int, H: int
 ) -> Tuple[int, int]:
@@ -335,7 +369,7 @@ class PathFollower:
         alpha = min(1.0, self.t / self.warmup_time)
         return self.v_init + alpha * (self.v_max_nominal - self.v_init)
 
-    def step(self, cur_xy: Tuple[float, float]) -> Tuple[float, float]:
+    def step(self, cur_xy: Tuple[float, float] | None = None) -> Tuple[float, float]:
         self.t += self.dt
         vmax_now = self._warmup_vmax()
         s_remain = max(0.0, self.s_total - self.s_ref)
