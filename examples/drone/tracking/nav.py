@@ -1,6 +1,5 @@
 """
-
-使用 path search 里的类进行配置，更符合训练
+Use A-star or PRM to plan a path for the drone to track a moving target in a 3D environment with obstacles.
 """
 import os
 import yaml
@@ -13,6 +12,9 @@ from utils import setup_random_cylindrical_obstacles
 from path_search import (
     sample_free_xy, plan_path, PathFollower
 )
+
+from path_search import sample_free_xy, PathFollower
+from roadmap import Roadmap
 
 class TrackerEnv:
     def __init__(self, num_envs, show_viewer=False):
@@ -119,6 +121,26 @@ class TrackerEnv:
         self.obs_xy = torch.tensor(obs_xy, dtype=torch.float32, device=self.device) if len(obs_xy) > 0 else torch.zeros((0,2), dtype=torch.float32, device=self.device)
         self.obs_r  = torch.tensor(obs_r , dtype=torch.float32, device=self.device) if len(obs_r ) > 0 else torch.zeros((0,),  dtype=torch.float32, device=self.device)
 
+        # ----- PRM 路网：把障碍搬到 CPU numpy 并构建一次 -----
+        self.obs_xy_cpu_np = self.obs_xy.detach().to("cpu", copy=True).numpy().astype("float32")
+        self.obs_r_cpu_np  = self.obs_r.detach().to("cpu", copy=True).numpy().astype("float32")
+
+        # 参数先用这组（足够通用；需要更快/更稳再微调）
+        self.prm_num_nodes   = 1500
+        self.prm_k_neighbors = 12
+        self.prm_max_edge    = 2.5
+        self.prm_clearance   = self.inflation_default  # = drone_radius + safety_margin
+
+        self.roadmap = Roadmap.build(
+            world_min=self.world_xy_min,
+            world_max=self.world_xy_max,
+            obs_xy=self.obs_xy_cpu_np,
+            obs_r=self.obs_r_cpu_np,
+            n_nodes=self.prm_num_nodes,
+            k=self.prm_k_neighbors,
+            max_edge_len=self.prm_max_edge,
+            clearance=self.prm_clearance,
+        )
 
         # 可视化目标
         self.target = self.scene.add_entity(
@@ -171,11 +193,92 @@ class TrackerEnv:
         self.drone.set_quat(self.drone_init_quat)
 
         # 生成目标与路径
-        self.plan_new_mission()
+        # self.plan_astar_mission()
+        self.plan_prm_mission()
 
     # ---------- 初始化 / 规划 ----------
 
-    def plan_new_mission(self):
+    def plan_prm_mission(self):
+        cur = self.drone.get_pos()[0]
+        start_xy = (cur[0].item(), cur[1].item())
+
+        with torch.no_grad():
+            path_found = False
+            chosen_goal = None
+            chosen_path = None
+
+            for attempt in range(self.max_replan_tries):
+                # 一次性采样一批候选目标（在 GPU 上采样也行；这里转成 python float）
+                goals_xy = []
+                for _ in range(self.goals_per_try):
+                    g = sample_free_xy(
+                        self.world_xy_min, self.world_xy_max,
+                        self.obs_xy, self.obs_r,
+                        safe_radius=self.prm_clearance,
+                        device=self.device
+                    )
+                    # g 可能是 tensor，取 float
+                    if isinstance(g, torch.Tensor):
+                        g = (float(g[0].item()), float(g[1].item()))
+                    goals_xy.append(g)
+
+                # 用 PRM 一次性查询（命中任意目标即返回路径）
+                path_np = self.roadmap.query(start_xy, goals_xy, k_attach=8)
+
+                if path_np is not None and path_np.shape[0] >= 2:
+                    # numpy -> python list[(x,y)]
+                    chosen_path = [(float(x), float(y)) for (x, y) in path_np.tolist()]
+                    chosen_goal = chosen_path[-1]
+                    path_found = True
+                    break
+                # 否则进入下一次 attempt（如果你愿意可以在这里把 goals_per_try 稍微调大）
+
+            if path_found:
+                self.goal_xy  = chosen_goal
+                self.path_wps = chosen_path
+
+                if getattr(self, "target", None) is not None:
+                    goal_pos = torch.tensor([[chosen_goal[0], chosen_goal[1], self.drone_height]],
+                                            dtype=torch.float32, device=self.device)
+                    self.target.set_pos(goal_pos)
+
+                if not hasattr(self, "follower"):
+                    self.follower = PathFollower(
+                        self.path_wps, self.dt,
+                        v_max=self.v_max, a_max=self.a_max,
+                        warmup_time=self.warmup_time, v_init=self.v_init,
+                        lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
+                        slow_down_k=1.2
+                    )
+                else:
+                    self.follower.reset_with_path(self.path_wps)
+                return
+
+            # ===== 失败兜底：保持你原来的行为 =====
+            print("[Planner] WARNING: No path found. Holding position and will retry after cooldown.")
+            hold_xy = (start_xy[0], start_xy[1])
+            self.goal_xy  = hold_xy
+            self.path_wps = [hold_xy, hold_xy]
+
+            if getattr(self, "target", None) is not None:
+                goal_pos = torch.tensor([[hold_xy[0], hold_xy[1], self.drone_height]],
+                                        dtype=torch.float32, device=self.device)
+                self.target.set_pos(goal_pos)
+
+            if not hasattr(self, "follower"):
+                self.follower = PathFollower(
+                    self.path_wps, self.dt,
+                    v_max=self.v_max, a_max=self.a_max,
+                    warmup_time=self.warmup_time, v_init=self.v_init,
+                    lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
+                    slow_down_k=1.2
+                )
+            else:
+                self.follower.reset_with_path(self.path_wps)
+
+            self.last_replan_step = self.step_count
+
+    def plan_astar_mission(self):
         # 起点取当前位姿（在 CPU 做规划，避免打断 GPU 渲染/控制）
         cur = self.drone.get_pos()[0]
         start_xy = (cur[0].item(), cur[1].item())
@@ -329,7 +432,8 @@ class TrackerEnv:
 
             self.last_replan_step = self.step_count
             print("[Mission] Reached goal. Replan.")
-            self.plan_new_mission()
+            # self.plan_astar_mission()
+            self.plan_prm_mission()
         
         
 

@@ -84,7 +84,7 @@ def setup_random_cylindrical_obstacles(
         scene, n_obstacles=20, min_radius=0.2, max_radius=0.3,
         min_height=3.0, max_height=5.0, min_distance=1.0,
         world_bounds=(-10, 10, -10, 10), device="cpu", oversample_factor=10,
-        origin_clearance=2.0  # 新增参数：原点周围清空的半径
+        origin_clearance=0.0  # 新增参数：原点周围清空的半径
 ):
     """
     Randomly generates and places non-overlapping cylindrical obstacles in a scene,

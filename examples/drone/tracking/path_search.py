@@ -78,6 +78,50 @@ def sample_free_xy(
             return x, y
     raise RuntimeError("sample_free_xy: failed to find a collision-free sample.")
 
+def sample_free_xy_batch(
+    world_xy_min: Tuple[float, float],
+    world_xy_max: Tuple[float, float],
+    obs_xy: torch.Tensor,     # [K,2]
+    obs_r:  torch.Tensor,     # [K]
+    safe_radius: float,
+    n: int,
+    max_tries: int = 2000,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    一次采 n 个与膨胀圆障碍不相交的点（[n,2], torch.float32）。
+    如果障碍为 0，则均匀采样即可。
+    """
+    device = device or (obs_xy.device if isinstance(obs_xy, torch.Tensor) else "cpu")
+    out = torch.empty((n, 2), dtype=torch.float32, device=device)
+    ok  = torch.zeros((n,), dtype=torch.bool, device=device)
+
+    if obs_xy.numel() == 0:
+        out[:, 0] = torch.empty(n, device=device).uniform_(world_xy_min[0], world_xy_max[0])
+        out[:, 1] = torch.empty(n, device=device).uniform_(world_xy_min[1], world_xy_max[1])
+        ok[:] = True
+        return out
+
+    thr = (obs_r + safe_radius)**2  # [K]
+    tries = 0
+    while (~ok).any() and tries < max_tries:
+        tries += 1
+        need = (~ok).nonzero(as_tuple=False).squeeze(-1)  # indices to fill
+        # 生成候选
+        cand = torch.empty((need.numel(), 2), dtype=torch.float32, device=device)
+        cand[:, 0].uniform_(world_xy_min[0], world_xy_max[0])
+        cand[:, 1].uniform_(world_xy_min[1], world_xy_max[1])
+        # 距离判定（广播）：[M,2] - [1,K,2] -> [M,K,2] -> [M,K]
+        d2 = (cand[:, None, :] - obs_xy[None, :, :]).pow(2).sum(-1)
+        free = torch.all(d2 >= thr[None, :], dim=1)        # [M]
+        # 写回
+        out[need[free]] = cand[free]
+        ok[need[free]] = True
+
+    if (~ok).any():
+        raise RuntimeError("sample_free_xy_batch: failed to sample enough points.")
+    return out
+
 def sample_origin_xy(
     r_min: float = 2.0,
     r_max: float = 3.0,
@@ -111,6 +155,56 @@ def sample_origin_xy_batch(
     x = center[0] + rho * torch.cos(theta)
     y = center[1] + rho * torch.sin(theta)
     return torch.stack([x, y], dim=1)  # (n,2)
+
+def sample_around_centers_batch(
+    centers_xy: torch.Tensor,   # [N,2] target 位置
+    r_min: float,
+    r_max: float,
+    obs_xy: torch.Tensor,       # [K,2]
+    obs_r:  torch.Tensor,       # [K]
+    safe_radius: float,
+    max_tries: int = 2000,
+) -> torch.Tensor:
+    """
+    对每个 center 采 1 个点：半径~U[r_min,r_max]、角度~U[0,2π)，并确保与障碍 (r+safe) 不相交。
+    返回 [N,2]
+    """
+    device = centers_xy.device
+    N = centers_xy.shape[0]
+    out = torch.empty((N, 2), dtype=torch.float32, device=device)
+    ok  = torch.zeros((N,), dtype=torch.bool, device=device)
+
+    if obs_xy.numel() == 0:
+        # 无障碍，直接采样
+        theta = torch.empty(N, device=device).uniform_(0, 2*math.pi)
+        rr    = torch.empty(N, device=device).uniform_(r_min, r_max)
+        out[:, 0] = centers_xy[:, 0] + rr*torch.cos(theta)
+        out[:, 1] = centers_xy[:, 1] + rr*torch.sin(theta)
+        ok[:] = True
+        return out
+
+    thr = (obs_r + safe_radius)**2  # [K]
+    tries = 0
+    while (~ok).any() and tries < max_tries:
+        tries += 1
+        need = (~ok).nonzero(as_tuple=False).squeeze(-1)
+        M = need.numel()
+        theta = torch.empty(M, device=device).uniform_(0, 2*math.pi)
+        rr    = torch.empty(M, device=device).uniform_(r_min, r_max)
+        cand = torch.empty((M, 2), dtype=torch.float32, device=device)
+        c = centers_xy[need]  # [M,2]
+        cand[:, 0] = c[:, 0] + rr*torch.cos(theta)
+        cand[:, 1] = c[:, 1] + rr*torch.sin(theta)
+        # 与障碍的距离判定
+        d2 = (cand[:, None, :] - obs_xy[None, :, :]).pow(2).sum(-1)  # [M,K]
+        free = torch.all(d2 >= thr[None, :], dim=1)
+        out[need[free]] = cand[free]
+        ok[need[free]]  = True
+
+    if (~ok).any():
+        raise RuntimeError("sample_around_centers_batch: failed for some centers.")
+    return out
+
 
 def world_to_grid(
     x: float, y: float, world_xy_min: Tuple[float, float], cell: float, W: int, H: int

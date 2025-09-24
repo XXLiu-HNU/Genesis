@@ -1,3 +1,7 @@
+# TODO 设计奖励函数。
+# 实现目标的稳定跟踪
+# 增加课程学习 
+
 import os
 import torch
 import math
@@ -8,6 +12,7 @@ from pid import PIDcontroller
 from odom import Odom
 from genesis.utils.geom import (
     quat_to_xyz,
+    xyz_to_quat,
     transform_by_quat,
     inv_quat,
     transform_quat_by_quat,
@@ -15,7 +20,7 @@ from genesis.utils.geom import (
 from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles
 
 from path_search import (
-    sample_free_xy, sample_origin_xy_batch, PathFollower
+    sample_free_xy, PathFollower, sample_free_xy_batch, sample_around_centers_batch
 )
 from roadmap import Roadmap,_line_of_sight_free
 
@@ -147,7 +152,7 @@ class TrackerEnv:
             self.world_xy_min[0], self.world_xy_max[0],
             self.world_xy_min[1], self.world_xy_max[1],
         )
-        obs, obs_xy, obs_r = setup_random_cylindrical_obstacles(self.scene, n_obstacles=self.n_obstacles, world_bounds=world_bounds_xyxy,origin_clearance = 3.0, min_distance = 2.0)
+        obs, obs_xy, obs_r = setup_random_cylindrical_obstacles(self.scene, n_obstacles=self.n_obstacles, world_bounds=world_bounds_xyxy,origin_clearance = 0.0, min_distance = 2.0)
 
         self.obs_xy = torch.tensor(obs_xy, dtype=torch.float32, device=self.device) if len(obs_xy) > 0 else torch.zeros((0,2), dtype=torch.float32, device=self.device)
         self.obs_r  = torch.tensor(obs_r , dtype=torch.float32, device=self.device) if len(obs_r ) > 0 else torch.zeros((0,),  dtype=torch.float32, device=self.device)
@@ -486,26 +491,20 @@ class TrackerEnv:
             return
 
         num_resets = len(envs_idx)
-
-        # ! -------------------------- reset tracker --------------------------
-        self.tracker_pos[envs_idx] = self.tracker_init_pos
-        self.tracker_last_pos[envs_idx] = self.tracker_init_pos
-        self.tracker_quat[envs_idx] = self.tracker_init_quat.repeat(num_resets, 1)
-        self.tracker.set_pos(self.tracker_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
-        self.tracker.set_quat(self.tracker_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
-        self.tracker_lin_vel[envs_idx] = 0.0
-        self.tracker_ang_vel[envs_idx] = 0.0
-        self.tracker.zero_all_dofs_velocity(envs_idx)
+        inflation = self.inflation_default
 
         # ! -------------------------- reset target --------------------------
-        # 批量采样起点
-        start_xys = sample_origin_xy_batch(num_resets, r_min=2.0, r_max=2.5,
-                                        center=(0.0,0.0), device=self.device)  # (num_resets,2)
+        # sample new target position
+        tgt_xy = sample_free_xy_batch(
+            self.world_xy_min, self.world_xy_max,
+            self.obs_xy, self.obs_r,
+            safe_radius=inflation,
+            n=num_resets, device=self.device
+        )  # [n,2] # (num_resets,2)
 
-        # 构造新的起始位置 (num_resets,3)
         new_target_pos = torch.zeros((num_resets, 3), device=self.device)
-        new_target_pos[:, 0] = start_xys[:, 0]
-        new_target_pos[:, 1] = start_xys[:, 1]
+        new_target_pos[:, 0] = tgt_xy[:, 0]
+        new_target_pos[:, 1] = tgt_xy[:, 1]
         new_target_pos[:, 2] = self.drone_height
         
         self.target_pos[envs_idx] = new_target_pos
@@ -516,6 +515,40 @@ class TrackerEnv:
         self.target_lin_vel[envs_idx] = 0.0
         self.target_ang_vel[envs_idx] = 0.0
         self.target.zero_all_dofs_velocity(envs_idx)
+
+        # ! -------------------------- reset tracker --------------------------
+        # reset range from target
+        r_min, r_max = 2.0, 2.5  
+        trk_xy = sample_around_centers_batch(
+            tgt_xy, r_min, r_max,
+            self.obs_xy, self.obs_r,
+            safe_radius=inflation
+        )  # [n,2]
+
+        new_trk_pos = torch.zeros((num_resets, 3), device=self.device, dtype=torch.float32)
+        new_trk_pos[:, :2] = trk_xy
+        new_trk_pos[:, 2] = self.drone_height
+
+
+        self.tracker_pos[envs_idx] = new_trk_pos
+        self.tracker_last_pos[envs_idx] = new_trk_pos
+
+        # face towards target
+        dir_xy = tgt_xy - trk_xy  # (N,2)
+        yaw = torch.atan2(dir_xy[:, 1], dir_xy[:, 0])  # (N,)
+        rpy = torch.stack([
+            torch.zeros_like(yaw),   # roll
+            torch.zeros_like(yaw),   # pitch
+            yaw                      # yaw
+        ], dim=-1)  # (N,3)
+        facing_quat = xyz_to_quat(rpy, rpy=True, degrees=False)
+
+        self.tracker_quat[envs_idx] = facing_quat
+        self.tracker.set_pos(self.tracker_pos[envs_idx],  zero_velocity=True, envs_idx=envs_idx)
+        self.tracker.set_quat(self.tracker_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.tracker_lin_vel[envs_idx] = 0.0
+        self.tracker_ang_vel[envs_idx] = 0.0
+        self.tracker.zero_all_dofs_velocity(envs_idx)
         
         # ! -------------------------- reset relative position --------------------------
         self.rel_pos[envs_idx] = self.target_pos[envs_idx] - self.tracker_pos[envs_idx]
