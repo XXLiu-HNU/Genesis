@@ -19,6 +19,8 @@ from genesis.utils.geom import (
 )
 from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles
 
+from depth_visibility_2d import visibility_and_tto_2d, Params2D
+
 from path_search import (
     sample_free_xy, PathFollower, sample_free_xy_batch, sample_around_centers_batch
 )
@@ -781,7 +783,7 @@ class TrackerEnv:
         speed_penalty = (exceed_speed ** 2) * 2.0  # 惩罚系数 2.0
         return speed_penalty
 
-    def _reward_visibility(self):
+    def _reward_visibility_dir(self):
         """
         计算并奖励无人机朝向与目标运动方向及相对位置的对齐程度。
         """
@@ -812,3 +814,12 @@ class TrackerEnv:
         visibility_reward = w_direction * reward_direction + w_yaw * reward_yaw
         
         return visibility_reward
+    
+    def _reward_visibility_obs(self):
+        """
+        计算并奖励无人机朝向与目标运动方向及相对位置的对齐程度。
+        """
+        params = Params2D(alpha=8.0, dt=self.dt, H=8, w_v=0.7, w_tto=0.3)
+        out = visibility_and_tto_2d(self.obs_centers, self.obs_radii, self.target_pos, self.target_vel, self.tracker_pos, self.tracker_vel, params)
+        print(out["V0"], out["TTO"], out["reward"])
+        return out["reward"]

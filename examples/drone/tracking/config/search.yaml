@@ -13,8 +13,8 @@ safety:
   margin: 0.12                  # 额外安全余量（与障碍保持距离）
 
 follower:                        # 路径跟随器参数
-  v_max: 0.6                     # 最大巡航速度
-  a_max: 1.2                     # 最大加速度
+  v_max: 1.0                     # 最大巡航速度
+  a_max: 2.0                     # 最大加速度
   warmup_time: 2.5               # 从 v_init 线性加速到 v_max 所需时间（秒）
   v_init: 0.08                   # 初始速度上限（防止刚开始加速过猛）
   lookahead_time: 0.5            # 前瞻时间（秒），决定参考点超前多少

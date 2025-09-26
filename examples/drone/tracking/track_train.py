@@ -107,7 +107,8 @@ def get_cfgs():
             "smooth": -0.1,
             "crash": -20.0,
             "max_speed": -0.5,
-            "visibility": 1,
+            "visibility_dir": 1,
+            "visibility_obs": 1,
         },
     }
 
