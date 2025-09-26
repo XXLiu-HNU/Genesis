@@ -820,6 +820,6 @@ class TrackerEnv:
         计算并奖励无人机朝向与目标运动方向及相对位置的对齐程度。
         """
         params = Params2D(alpha=8.0, dt=self.dt, H=8, w_v=0.7, w_tto=0.3)
-        out = visibility_and_tto_2d(self.obs_centers, self.obs_radii, self.target_pos, self.target_vel, self.tracker_pos, self.tracker_vel, params)
-        print(out["V0"], out["TTO"], out["reward"])
+        out = visibility_and_tto_2d(self.obs_xy, self.obs_r, self.target_pos[:,:2], self.target_lin_vel[:,:2], self.tracker_pos[:,:2], self.tracker_lin_vel[:,:2], params)
+        # print(out["V0"], out["TTO"], out["reward"])
         return out["reward"]
