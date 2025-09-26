@@ -6,7 +6,7 @@ world:
   extra_grid_margin_min: 0.00      # 允许膨胀减小到的最小值（逐步放宽时用）
 
 drone:
-  height: 1.0                   # 无人机飞行高度（z 恒定）
+  height: 1.5                  # 无人机飞行高度（z 恒定）
   radius: 0.12                  # 无人机在水平面的等效半径（机臂长度）
 
 safety:

@@ -131,12 +131,12 @@ class TrackerEnv:
         self.tracker_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
         self.tracker_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.tracker_inv_init_quat = inv_quat(self.tracker_init_quat)
-        self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
+        self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/tracker_drone_urdf/drone.urdf"))
 
         # ! Add Traget
         self.target_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.target_inv_init_quat = inv_quat(self.target_init_quat)
-        self.target = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/drone_urdf/drone.urdf"))
+        self.target = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/target_drone_urdf/drone.urdf"))
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(script_dir, "config/pos.yaml"), "r") as file:
@@ -344,39 +344,39 @@ class TrackerEnv:
 
         cur_pos = self.target.get_pos()   # shape [num_envs, 3]
         cur_xy = cur_pos[:, :2]           # (N,2)
+
         ref_pos = torch.zeros((self.num_envs, 4), device=self.device)
-        
-        ref_pos[:, 2] = self.drone_height   # 一次性填好 z
-        ref_pos[:, 3] = 0.0                 # 一次性填好 yaw
+        ref_pos[:, 2] = self.drone_height
+        ref_pos[:, 3] = 0.0
 
-
-        # 1) 收集有路径跟随器的 env 索引，避免每次属性访问
+        # 1) 收集有路径跟随器的 env 索引
         has_follower = [i for i in range(self.num_envs) if self.followers[i] is not None]
         M = len(has_follower)
 
         if M > 0:
-            # 2) 批量调用 step（不传 cur_xy；也不构造 tuple）
+            # 2) 批量调用 step
             next_list = [self.followers[i].step() for i in has_follower]   # List[(x,y)]
 
-            # 3) 一次性写回 ref_pos 的 x,y（避免每步两次标量赋值）
-            next_xy = torch.tensor(next_list, device=self.device, dtype=gs.tc_float)
+            # 3) 只写入 x,y，不覆盖 z
+            next_xy = torch.tensor(next_list, device=self.device, dtype=gs.tc_float)  # (M,2)
             idx = torch.tensor(has_follower, device=self.device, dtype=torch.long)
-            ref_pos.index_copy_(0, idx, torch.cat([next_xy, torch.full((M,2), 0.0, device=self.device, dtype=gs.tc_float)], dim=1))
+            ref_pos[idx, 0:2] = next_xy
 
-            # 4) 批量判断 reached_goal，再少量 Python 入队（通常只有极少数 true）
+            # 4) 批量判断 reached_goal
             reached = [i for i in has_follower if self.followers[i].reached_goal(thresh=self.goal_reach_thresh)]
             for env_id in reached:
                 if env_id not in self.replan_inqueue:
                     self.replan_queue.append(env_id)
                     self.replan_inqueue.add(env_id)
 
-        # 5) 没有 follower 的 env：原地（向量化处理）
+        # 5) 没有 follower 的 env：保持当前位置
         no_follower_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         if M > 0:
             no_follower_mask[idx] = False
         if no_follower_mask.any():
-            ref_pos[no_follower_mask, :3] = cur_pos[no_follower_mask]
+            ref_pos[no_follower_mask, :3] = cur_pos[no_follower_mask]  # 保持原位置 (x,y,z)
             ref_pos[no_follower_mask, 3]  = 0.0
+
 
         target_prop_rpms = self.target.controller.step(ref_pos)
         self.target.set_propellels_rpm(target_prop_rpms)
