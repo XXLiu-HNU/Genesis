@@ -17,7 +17,7 @@ from genesis.utils.geom import (
     inv_quat,
     transform_quat_by_quat,
 )
-from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles
+from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles, relative_position_body, relative_velocity_body, orientation_state, obstacle_features, quat_to_rotmat
 
 from depth_visibility_2d import visibility_and_tto_2d, Params2D
 
@@ -391,7 +391,6 @@ class TrackerEnv:
         self.target_last_pos[:] = self.target_pos[:]
         self.target_pos[:] = self.target.get_pos()
 
-        self.rel_pos = self.target_pos - self.tracker_pos
 
         self.tracker_quat[:] = self.tracker.get_quat()
         self.tracker_euler = quat_to_xyz(
@@ -414,6 +413,14 @@ class TrackerEnv:
         inv_target_quat = inv_quat(self.target_quat)
         self.target_lin_vel[:] = transform_by_quat(self.target.get_vel(), inv_target_quat)
         self.target_ang_vel[:] = transform_by_quat(self.target.get_ang(), inv_target_quat)
+
+        # Change state to relative position and velocity in body frame
+        # self.rel_pos = self.target_pos - self.tracker_pos
+        self.rel_pos = relative_position_body(self.tracker_pos, self.tracker_quat,self.target_pos)
+        self.rel_vel = relative_velocity_body(self.tracker_lin_vel, self.target_lin_vel, self.tracker_quat)
+
+        
+        # shape == (n_envs,7) -> [x_w(3), z_w(3), cos_upright(1)]
 
         # check termination and reset
         # 判断终止条件
@@ -452,17 +459,49 @@ class TrackerEnv:
             # print(f"{name} reward: {rew.mean().item():.3f}")
 
         # ! -------------------------- compute observations --------------------------
-        self.obs_buf = torch.cat(
-            [
-                torch.clip(self.rel_pos * self.obs_scales["max_diff"], -1, 1),          # relative position
-                self.tracker_quat,                                                      # tracker quaternion
-                torch.clip(self.tracker_lin_vel * self.obs_scales["max_lin"], -1, 1),   # tracker linear velocity
-                torch.clip(self.tracker_ang_vel * self.obs_scales["max_ang"], -1, 1),   # tracker angular velocity
-                torch.clip(self.target_lin_vel * self.obs_scales["max_lin"], -1, 1),    # target linear velocity
-                torch.clip(self.last_actions * self.obs_scales["max_lin"], -1, 1),      # last action
-            ],
-            axis=-1,
+        
+        self.rel_pos = relative_position_body(self.tracker_pos, self.tracker_quat,self.target_pos)
+        self.rel_vel = relative_velocity_body(self.tracker_lin_vel, self.target_lin_vel, self.tracker_quat)
+        ori_feat = orientation_state(self.tracker_quat)
+
+        feats = obstacle_features(
+            tracker_pos_w=self.tracker_pos,
+            tracker_quat=self.tracker_quat,
+            tracker_lin_vel_w=self.tracker_lin_vel,
+            obs_xy_w=self.obs_xy,      # (N,M,2) 或 (M,2)
+            obs_r=self.obs_r,          # (N,M,1) 或 (M,1)
+            range_max=20.0,
+            ttc_max=5.0,
+            K=8,
+            quat_format="xyzw",
         )
+
+        obs_env = torch.cat([
+            feats["d_min_norm"],
+            feats["bearing_min_pi"],
+            feats["ttc_min_norm"],
+            feats["mean_clear_norm"],
+            feats["heading_clear_norm"],
+            feats["sector_mins_norm"],   # 若 K>0
+        ], dim=-1)                       # (N, 4+3+4+1+1+K)
+
+        eps = 1e-6
+        N = self.rel_pos.size(0)
+
+        # 2) 正确缩放 last_actions：角速度/推力分开
+        #    假定 self.last_actions: (N,4) -> [p_cmd, q_cmd, r_cmd, T_cmd]
+        ang_prev = torch.clamp(self.last_actions[:, :3] , -1.0, 1.0)     # (N,3)
+        thrust_prev = torch.clamp(self.last_actions[:, 3:4] , -1.0, 1.0)  # (N,1)
+
+        # 4) 主观测拼装（与原缩放风格一致）
+        self.obs_buf = torch.cat([
+            torch.clamp(self.rel_pos * self.obs_scales["max_diff"], -1.0, 1.0),       # (N,3)  机体系相对位置
+            torch.clamp(self.rel_vel * self.obs_scales["max_lin"], -1.0, 1.0),        # (N,3)  机体系相对速度
+            torch.clamp(self.tracker_ang_vel * self.obs_scales["max_ang"], -1.0, 1.0),# (N,3)  自身角速度（机体系）
+            ang_prev, thrust_prev,                                                     # (N,3)+(N,1)
+            ori_feat,                                                                  # (N,7)  [x_w(3), z_w(3), cos_upright(1)]
+            obs_env,                                                                   # (N, 5+K)
+        ], dim=-1)
 
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
@@ -785,34 +824,44 @@ class TrackerEnv:
 
     def _reward_visibility_dir(self):
         """
-        计算并奖励无人机朝向与目标运动方向及相对位置的对齐程度。
+        奖励：机头前向 与 (目标速度方向、指向目标方向) 的对齐程度（机体系）。
+
+        要求：
+        - self.rel_pos 是机体系 (target - tracker in body)
+        - self.target_lin_vel 是世界系线速度
+        - self.tracker_quat 可用于 world->body 旋转
         """
-        # 获取追踪无人机在世界坐标系下的朝向向量
-        # 假设无人机机头方向为 body-frame 的 x 轴
-        forward_vec_body = torch.tensor([1.0, 0, 0], device=self.device).expand(self.num_envs, -1)
-        forward_vec_world = transform_by_quat(forward_vec_body, self.tracker_quat)
+        eps = 1e-6
 
-        # ! 1. 计算第一个奖励项：运动方向对齐
-        # 获取目标无人机在世界坐标系下的运动方向向量
-        target_vel = self.target.get_vel()
-        vel_norm = torch.norm(target_vel, dim=-1, keepdim=True)
-        epsilon = 1e-6
-        target_vel_normalized = target_vel / (vel_norm + epsilon)
-        reward_direction = torch.sum(forward_vec_world * target_vel_normalized, dim=-1)
+        # 1) 机体系前向向量（常量）
+        f_b = torch.tensor([1.0, 0.0, 0.0], device=self.device)\
+                .expand(self.num_envs, -1)                             # (N,3)
 
-        # ! 2. 计算第二个奖励项：空间位置朝向对齐
-        # 获取指向目标的方向向量
-        direction_to_target = self.rel_pos
-        pos_norm = torch.norm(direction_to_target, dim=-1, keepdim=True)
-        direction_to_target_normalized = direction_to_target / (pos_norm + epsilon)
-        reward_yaw = torch.sum(forward_vec_world * direction_to_target_normalized, dim=-1)
+        # 2) 目标速度转到机体系
+        #    R_bw: world -> body
+        R_bw = quat_to_rotmat(self.tracker_quat)                       # (N,3,3)
+        v_t_b = torch.bmm(R_bw, self.target_lin_vel.unsqueeze(-1))\
+                .squeeze(-1)                                         # (N,3)
+        v_t_dir = v_t_b / (torch.norm(v_t_b, dim=-1, keepdim=True) + eps)
 
-        # ! 3. 定义权重。你可以根据需要调整这些值。
-        # 例如，如果运动方向的对齐更重要，可以增加 w_direction 的值。
-        w_direction = 0.5
-        w_yaw = 0.5
-        visibility_reward = w_direction * reward_direction + w_yaw * reward_yaw
-        
+        # 3) 机体系相对位置方向（已由你预先提供）
+        r_b = self.rel_pos                                             # (N,3) body-frame
+        r_dir = r_b / (torch.norm(r_b, dim=-1, keepdim=True) + eps)
+
+        # 4) 两个对齐分数（余弦，范围[-1,1]）
+        align_vel = torch.sum(f_b * v_t_dir, dim=-1)                   # 与目标速度方向对齐
+        align_pos = torch.sum(f_b * r_dir,   dim=-1)                   # 与目标指向对齐
+
+        # 5) 自适应权重：目标几乎不动时，更依赖位置对齐；目标速度大时，更依赖速度对齐
+        #    你也可以改回常数权重 w_direction=0.5, w_yaw=0.5
+        speed = torch.norm(v_t_b, dim=-1, keepdim=True)                # (N,1)
+        w_dir = torch.sigmoid( (speed - 0.5) * 3.0 )                   # 速度≈0->~0, 速度高->~1
+        w_yaw = 1.0 - w_dir
+
+        # 6) 合成奖励
+        visibility_reward = (w_dir.squeeze(-1) * align_vel +
+                            w_yaw.squeeze(-1) * align_pos)
+
         return visibility_reward
     
     def _reward_visibility_obs(self):

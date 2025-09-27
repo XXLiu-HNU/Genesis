@@ -1,5 +1,6 @@
 import torch
 import genesis as gs
+from typing import Literal, Tuple, Dict
 
 # ---------- 小工具 ----------
 def _to_xy(p: torch.Tensor) -> torch.Tensor:
@@ -158,3 +159,482 @@ def setup_random_cylindrical_obstacles(
         print(f"Warning: Only generated {len(obstacles)} obstacles (requested {n_obstacles})")
 
     return obstacles, obstacle_positions, obstacle_radii
+
+
+# ! ------------------------------- Pos/Vel  Features --------------------------------------
+
+"""
+Utilities for converting world-frame vectors to the tracker's body frame,
+and computing relative position / velocity in the body frame.
+"""
+
+QuatFormat = Literal["xyzw", "wxyz"]
+
+
+def _ensure_batch(x: torch.Tensor, last_dim: int) -> Tuple[torch.Tensor, bool]:
+    """Make tensor at least 2D: (N, last_dim). Return (tensor, was_squeezed)."""
+    if x.dim() == 1:
+        assert x.shape[0] == last_dim, f"Expected shape ({last_dim},), got {tuple(x.shape)}"
+        return x.unsqueeze(0), True
+    elif x.dim() == 2:
+        assert x.shape[1] == last_dim, f"Expected shape (*,{last_dim}), got {tuple(x.shape)}"
+        return x, False
+    else:
+        raise ValueError(f"Expected 1D or 2D tensor, got shape {tuple(x.shape)}")
+
+def _split_quat(q: torch.Tensor, quat_format: QuatFormat) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (w,x,y,z) as separate tensors, independent of input convention."""
+    if quat_format == "xyzw":
+        x, y, z, w = q.unbind(dim=-1)
+    elif quat_format == "wxyz":
+        w, x, y, z = q.unbind(dim=-1)
+    else:
+        raise ValueError("quat_format must be 'xyzw' or 'wxyz'")
+    return w, x, y, z
+
+
+def quat_to_rotmat(q: torch.Tensor, quat_format: QuatFormat = "xyzw") -> torch.Tensor:
+    """
+    Convert quaternion(s) to rotation matrix (world->body).
+
+    Args:
+        q: (4,) or (N,4) quaternion(s). Convention controlled by `quat_format`.
+        quat_format: "xyzw" (default) or "wxyz".
+
+    Returns:
+        R: (3,3) or (N,3,3) rotation matrix mapping world vectors into the BODY frame
+           of the tracker (i.e., R_bw).
+
+    Notes:
+        - Quaternions are normalized internally for robustness.
+        - If any quaternion has (near-)zero norm, a safe identity is used.
+    """
+    q_in, squeezed = _ensure_batch(q, 4)
+    # Normalize (with safe guard)
+    eps = 1e-9
+    norms = torch.linalg.norm(q_in, dim=-1, keepdim=True)
+    safe = norms > eps
+    qn = torch.where(safe, q_in / norms.clamp_min(eps), torch.tensor([0., 0., 0., 1.], device=q_in.device, dtype=q_in.dtype).expand_as(q_in))
+
+    w, x, y, z = _split_quat(qn, quat_format)
+
+    # Precompute terms
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
+    # Rotation from world to body given body orientation quaternion q (body wrt world)
+    # Using standard passive interpretation: R(q) rotates world vectors into the body frame.
+    r00 = 1.0 - 2.0 * (yy + zz)
+    r01 = 2.0 * (xy - wz)
+    r02 = 2.0 * (xz + wy)
+
+    r10 = 2.0 * (xy + wz)
+    r11 = 1.0 - 2.0 * (xx + zz)
+    r12 = 2.0 * (yz - wx)
+
+    r20 = 2.0 * (xz - wy)
+    r21 = 2.0 * (yz + wx)
+    r22 = 1.0 - 2.0 * (xx + yy)
+
+    R = torch.stack([
+        torch.stack([r00, r01, r02], dim=-1),
+        torch.stack([r10, r11, r12], dim=-1),
+        torch.stack([r20, r21, r22], dim=-1),
+    ], dim=-2)  # (N,3,3)
+
+    if squeezed:
+        R = R.squeeze(0)  # (3,3)
+    return R
+
+
+def world_to_body(vec_world: torch.Tensor, tracker_quat: torch.Tensor, quat_format: QuatFormat = "xyzw") -> torch.Tensor:
+    """
+    Transform world-frame vector(s) to the tracker's body frame.
+
+    Args:
+        vec_world: (3,) or (N,3)
+        tracker_quat: (4,) or (N,4)
+        quat_format: "xyzw" or "wxyz"
+
+    Returns:
+        vec_body: (3,) or (N,3)
+    """
+    v_in, v_squeezed = _ensure_batch(vec_world, 3)
+    q_in, q_squeezed = _ensure_batch(tracker_quat, 4)
+
+    if v_in.shape[0] != q_in.shape[0]:
+        if v_in.shape[0] == 1:
+            v_in = v_in.expand(q_in.shape[0], -1)
+        elif q_in.shape[0] == 1:
+            q_in = q_in.expand(v_in.shape[0], -1)
+        else:
+            raise ValueError("Batch size mismatch between vec_world and tracker_quat.")
+
+    R_bw = quat_to_rotmat(q_in, quat_format=quat_format)  # (N,3,3)
+    v_body = torch.bmm(R_bw, v_in.unsqueeze(-1)).squeeze(-1)  # (N,3)
+
+    if v_squeezed and q_squeezed:
+        v_body = v_body.squeeze(0)
+    return v_body
+
+
+def relative_position_body(
+    tracker_pos_world: torch.Tensor,
+    tracker_quat: torch.Tensor,
+    target_pos_world: torch.Tensor,
+    quat_format: QuatFormat = "xyzw",
+) -> torch.Tensor:
+    """
+    Compute relative position (target - tracker) expressed in the tracker's body frame.
+
+    Args:
+        tracker_pos_world: (3,) or (N,3)
+        tracker_quat:      (4,) or (N,4)
+        target_pos_world:  (3,) or (N,3)
+        quat_format: "xyzw" or "wxyz"
+
+    Returns:
+        r_bt_body: (3,) or (N,3)  # in body frame
+    """
+    p_b, b1 = _ensure_batch(tracker_pos_world, 3)
+    p_t, b2 = _ensure_batch(target_pos_world, 3)
+    q,   b3 = _ensure_batch(tracker_quat, 4)
+
+    # Broadcast if needed
+    N = max(p_b.shape[0], p_t.shape[0], q.shape[0])
+    if p_b.shape[0] != N: p_b = p_b.expand(N, -1)
+    if p_t.shape[0] != N: p_t = p_t.expand(N, -1)
+    if q.shape[0]   != N: q   = q.expand(N, -1)
+
+    rel_world = p_t - p_b            # (N,3) target - tracker in world
+    r_bt_body = world_to_body(rel_world, q, quat_format=quat_format)  # (N,3)
+
+    if b1 and b2 and b3:
+        r_bt_body = r_bt_body.squeeze(0)
+    return r_bt_body
+
+
+def relative_velocity_body(
+    tracker_lin_vel_world: torch.Tensor,
+    target_lin_vel_world: torch.Tensor,
+    tracker_quat: torch.Tensor,
+    quat_format: QuatFormat = "xyzw",
+) -> torch.Tensor:
+    """
+    Compute relative linear velocity v_rel = v_t_body - v_b_body in the tracker's body frame.
+
+    Args:
+        tracker_lin_vel_world: (3,) or (N,3)
+        target_lin_vel_world:  (3,) or (N,3)
+        tracker_quat:          (4,) or (N,4)
+        quat_format: "xyzw" or "wxyz"
+
+    Returns:
+        v_rel_body: (3,) or (N,3)
+    """
+    v_b_w, b1 = _ensure_batch(tracker_lin_vel_world, 3)
+    v_t_w, b2 = _ensure_batch(target_lin_vel_world, 3)
+    q,     b3 = _ensure_batch(tracker_quat, 4)
+
+    # Broadcast if needed
+    N = max(v_b_w.shape[0], v_t_w.shape[0], q.shape[0])
+    if v_b_w.shape[0] != N: v_b_w = v_b_w.expand(N, -1)
+    if v_t_w.shape[0] != N: v_t_w = v_t_w.expand(N, -1)
+    if q.shape[0]     != N: q     = q.expand(N, -1)
+
+    # Rotate both velocities into body frame
+    v_b_body = world_to_body(v_b_w, q, quat_format=quat_format)  # (N,3)
+    v_t_body = world_to_body(v_t_w, q, quat_format=quat_format)  # (N,3)
+    v_rel_body = v_t_body - v_b_body
+
+    if b1 and b2 and b3:
+        v_rel_body = v_rel_body.squeeze(0)
+    return v_rel_body
+
+
+# ---- Optional: convenience for forward/up body axes in world frame ----
+
+def body_axes_in_world(tracker_quat: torch.Tensor, quat_format: QuatFormat = "xyzw") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Get body axes (forward x_b, right y_b, up z_b) expressed in WORLD frame.
+
+    Returns:
+        x_w, y_w, z_w: each (3,) or (N,3)
+    """
+    q, squeezed = _ensure_batch(tracker_quat, 4)
+    # R_wb is inverse of R_bw; since R is orthonormal, R_wb = R_bw^T
+    R_bw = quat_to_rotmat(q, quat_format=quat_format)         # (N,3,3)
+    R_wb = R_bw.transpose(-1, -2)
+
+    # Body basis in body frame
+    ex = torch.tensor([1., 0., 0.], device=q.device, dtype=q.dtype).expand(q.shape[0], -1, )
+    ey = torch.tensor([0., 1., 0.], device=q.device, dtype=q.dtype).expand(q.shape[0], -1, )
+    ez = torch.tensor([0., 0., 1.], device=q.device, dtype=q.dtype).expand(q.shape[0], -1, )
+
+    x_w = torch.bmm(R_wb, ex.unsqueeze(-1)).squeeze(-1)  # (N,3)
+    y_w = torch.bmm(R_wb, ey.unsqueeze(-1)).squeeze(-1)
+    z_w = torch.bmm(R_wb, ez.unsqueeze(-1)).squeeze(-1)
+
+    if squeezed:
+        x_w = x_w.squeeze(0); y_w = y_w.squeeze(0); z_w = z_w.squeeze(0)
+    return x_w, y_w, z_w
+
+
+
+# ! ------------------------------- Attitude  Features --------------------------------------
+
+
+def orientation_state(
+    tracker_quat: torch.Tensor,
+    quat_format: QuatFormat = "xyzw",
+    return_upright: bool = True,
+) -> torch.Tensor:
+    """
+    Build orientation features for observation.
+
+    Args:
+        tracker_quat: (4,) or (N,4) quaternion(s) of tracker (body wrt world).
+        quat_format: "xyzw" or "wxyz".
+        return_upright: if True, append upright cosine as the last dim.
+
+    Returns:
+        feat: (6,) or (N,6) if return_upright=False
+              (7,) or (N,7) if return_upright=True
+            where:
+              - first 3: x_w  (body forward axis in WORLD frame)
+              - next 3 : z_w  (body up axis in WORLD frame)
+              - last 1 : cos_upright = z_w · [0,0,1]  (optional)
+    Notes:
+        - Values are unit-length direction cosines in [-1, 1],无需再归一化。
+        - 采用“6D姿态表示”（两列旋转轴），数值稳定、无四元数符号二义性。
+    """
+    q, squeezed = _ensure_batch(tracker_quat, 4)
+    # R_wb is transpose of R_bw
+    R_bw = quat_to_rotmat(q, quat_format=quat_format)         # (N,3,3)
+    R_wb = R_bw.transpose(-1, -2)                             # (N,3,3)
+
+    # Body basis in world (columns of R_wb)
+    x_w = R_wb[..., 0]    # forward axis in world
+    z_w = R_wb[..., 2]    # up axis in world
+
+    if return_upright:
+        # upright cosine with world up [0,0,1]
+        cos_upright = z_w[..., 2:3]                           # (N,1)
+        feat = torch.cat([x_w, z_w, cos_upright], dim=-1)     # (N,7)
+    else:
+        feat = torch.cat([x_w, z_w], dim=-1)                  # (N,6)
+
+    if squeezed:
+        feat = feat.squeeze(0)
+    return feat
+
+# ! ------------------------------- Obstacle Features --------------------------------------
+
+"""
+    obstacle_features (vectorized, GPU-friendly)
+    Compute low-dimensional obstacle features from infinite-height cylinders (2D circles).
+    Everything is batch/vectorized; no Python loops on N/M/K.
+
+    Inputs:
+    - tracker_pos_w:        (N,3) or (3,)
+    - tracker_quat:         (N,4) or (4,)    quaternion (xyzw or wxyz)
+    - tracker_lin_vel_w:    (N,3) or (3,)
+    - obs_xy_w:             (N,M,2) or (M,2) circle centers in WORLD (z ignored)
+    - obs_r:                (N,M,1) or (M,1) radii
+
+    Hyperparams:
+    - range_max: float  (normalization for distances/raycast)
+    - ttc_max:   float  (normalization cap for TTC)
+    - K: int            number of angular sectors (0 to disable)
+    - quat_format: "xyzw" or "wxyz"
+
+    Outputs dict (per batch N):
+    - d_min_norm:          (N,1)   in [0,1]
+    - bearing_min_pi:      (N,1)   in [-1,1]
+    - ttc_min_norm:        (N,1)   in [0,1]
+    - mean_clear_norm:     (N,1)   in [0,1]
+    - var_clear_norm:      (N,1)   in [0,1]
+    - heading_clear_norm:  (N,1)   in [0,1]
+    - sector_mins_norm:    (N,K)   in [0,1]  (only if K>0)
+"""
+
+def quat_to_Rbw(q: torch.Tensor, quat_format: QuatFormat = "xyzw") -> torch.Tensor:
+    """Quaternion(s) -> rotation matrix R_bw (world->body)."""
+    q, sq = _ensure_batch(q, 4)
+    eps = 1e-9
+    q = q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=eps)
+
+    w, x, y, z = _split_quat(q, quat_format)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
+    r00 = 1 - 2 * (yy + zz); r01 = 2 * (xy - wz); r02 = 2 * (xz + wy)
+    r10 = 2 * (xy + wz);     r11 = 1 - 2 * (xx + zz); r12 = 2 * (yz - wx)
+    r20 = 2 * (xz - wy);     r21 = 2 * (yz + wx);     r22 = 1 - 2 * (xx + yy)
+
+    R = torch.stack([
+        torch.stack([r00, r01, r02], -1),
+        torch.stack([r10, r11, r12], -1),
+        torch.stack([r20, r21, r22], -1),
+    ], -2)  # (N,3,3)
+
+    return R.squeeze(0) if sq else R
+
+
+def world_to_body_xy(vec_w_xy: torch.Tensor, R_bw: torch.Tensor) -> torch.Tensor:
+    """
+    Transform planar vectors (x,y) from WORLD to BODY using R_bw (world->body).
+    vec_w_xy: (N,2) or (2,)
+    R_bw:     (N,3,3) or (3,3)
+    return:   (N,2) or (2,)
+    """
+    v, vs = _ensure_batch(vec_w_xy, 2)
+    R, Rs = _ensure_batch(R_bw.reshape(-1, 9), 9)
+    R = R.reshape(-1, 3, 3)
+
+    if v.shape[0] != R.shape[0]:
+        if v.shape[0] == 1:
+            v = v.expand(R.shape[0], -1)
+        elif R.shape[0] == 1:
+            R = R.expand(v.shape[0], -1, -1)
+        else:
+            raise ValueError("Batch mismatch in world_to_body_xy")
+
+    v3 = torch.cat([v, torch.zeros(v.shape[0], 1, device=v.device, dtype=v.dtype)], dim=-1)
+    vb = torch.bmm(R, v3.unsqueeze(-1)).squeeze(-1)[..., :2]
+    return vb.squeeze(0) if (vs and Rs) else vb
+
+
+# ---------- core features (fully vectorized) ----------
+
+def obstacle_features(
+    tracker_pos_w: torch.Tensor,
+    tracker_quat: torch.Tensor,
+    tracker_lin_vel_w: torch.Tensor,
+    obs_xy_w: torch.Tensor,
+    obs_r: torch.Tensor,
+    *,
+    range_max: float = 20.0,
+    ttc_max: float = 5.0,
+    K: int = 0,
+    quat_format: QuatFormat = "xyzw",
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute low-dim features from cylinders (2D circles). All in BODY frame.
+    Everything is vectorized (no Python for loops over N/M/K).
+    """
+    # ---- sanitize & broadcast ----
+    p_w, _ = _ensure_batch(tracker_pos_w, 3)       # (N,3)
+    q, _ = _ensure_batch(tracker_quat, 4)          # (N,4)
+    v_w, _ = _ensure_batch(tracker_lin_vel_w, 3)   # (N,3)
+
+    if obs_xy_w.dim() == 2:                        # (M,2) -> (N,M,2)
+        obs_xy_w = obs_xy_w.unsqueeze(0).expand(p_w.shape[0], -1, -1)
+    if obs_r.dim() == 2:                           # (M,1) -> (N,M,1)
+        obs_r = obs_r.unsqueeze(0).expand(p_w.shape[0], -1, -1)
+
+    N, M, _2 = obs_xy_w.shape
+    device = p_w.device
+    eps = 1e-6
+
+    # ---- rotations ----
+    R_bw = quat_to_Rbw(q, quat_format=quat_format)                     # (N,3,3)
+
+    # relative centers in WORLD -> BODY (planar)
+    rel_xy_w = obs_xy_w - p_w[:, :2].unsqueeze(1)                     # (N,M,2)
+    rel_xy_b = world_to_body_xy(rel_xy_w.reshape(-1, 2),
+                                 R_bw.repeat_interleave(M, 0)).view(N, M, 2)
+
+    # planar velocity in BODY
+    v_xy_b = world_to_body_xy(v_w[:, :2], R_bw)                       # (N,2)
+
+    # ---- boundary clearances ----
+    center_dist = torch.linalg.norm(rel_xy_b, dim=-1)                 # (N,M)
+    radii = obs_r.squeeze(-1)                                         # (N,M)
+    clear = center_dist - radii                                       # (N,M)  (can be negative if overlapping)
+
+    # nearest obstacle & bearing
+    d_min, idx_min = torch.min(clear, dim=1, keepdim=True)            # (N,1)
+    rel_min = torch.gather(rel_xy_b, 1, idx_min.unsqueeze(-1).expand(-1, -1, 2)).squeeze(1)  # (N,2)
+    bearing_min = torch.atan2(rel_min[:, 1], rel_min[:, 0]).unsqueeze(-1)                    # (N,1)
+    bearing_min_pi = torch.clamp(bearing_min / torch.pi, -1.0, 1.0)                          # [-1,1]
+
+    # ---- TTC to nearest (closing only) ----
+    u_rad = rel_min / (torch.linalg.norm(rel_min, dim=-1, keepdim=True) + eps)               # (N,2)
+    closing = torch.clamp(-torch.sum(v_xy_b * u_rad, dim=-1, keepdim=True), min=0.0)         # (N,1)
+    ttc = d_min / (closing + eps)                                                             # (N,1)
+    ttc_min_norm = torch.clamp(ttc, max=ttc_max) / ttc_max                                    # [0,1]
+
+    # ---- heading ray-cast clearance (ray dir = body +x) ----
+    cx, cy, rr = rel_xy_b[..., 0], rel_xy_b[..., 1], radii                                    # (N,M)
+    A = torch.ones_like(cx)
+    B = -2.0 * cx
+    C = cx * cx + cy * cy - rr * rr
+    disc = B * B - 4 * A * C                                                                  # (N,M)
+    disc_clamped = torch.clamp(disc, min=0.0)
+    sqrt_disc = torch.sqrt(disc_clamped)
+
+    s1 = ( -B - sqrt_disc ) / 2.0
+    s2 = ( -B + sqrt_disc ) / 2.0
+    pos_s1 = (disc >= 0.0) & (s1 > 0)
+    pos_s2 = (disc >= 0.0) & (s2 > 0)
+    s1 = torch.where(pos_s1, s1, torch.full_like(s1, float("inf")))
+    s2 = torch.where(pos_s2, s2, torch.full_like(s2, float("inf")))
+    s_hit = torch.minimum(s1, s2)                                                              # (N,M)
+
+    heading_clear = torch.min(s_hit, dim=1, keepdim=True).values                               # (N,1)
+    heading_clear_norm = torch.clamp(heading_clear, max=range_max) / range_max                 # [0,1]
+
+    # ---- global stats ----
+    clear_pos = torch.clamp(clear, min=0.0, max=range_max)                                     # (N,M) in [0,range_max]
+    mean_clear_norm = torch.mean(clear_pos, dim=1, keepdim=True) / range_max                   # (N,1)
+    var_clear_norm  = torch.var(clear_pos / range_max, dim=1, keepdim=True, unbiased=False)    # (N,1)
+
+    out: Dict[str, torch.Tensor] = {
+        "d_min_norm":         torch.clamp(d_min / range_max, 0.0, 1.0),
+        "bearing_min_pi":     bearing_min_pi,
+        "ttc_min_norm":       torch.clamp(ttc_min_norm, 0.0, 1.0),
+        "mean_clear_norm":    torch.clamp(mean_clear_norm, 0.0, 1.0),
+        "var_clear_norm":     torch.clamp(var_clear_norm, 0.0, 1.0),
+        "heading_clear_norm": torch.clamp(heading_clear_norm, 0.0, 1.0),
+    }
+
+    # ---- sector minima (vectorized) ----
+    if K and K > 0:
+        # angle of each obstacle in BODY in [0,2pi)
+        ang = (torch.atan2(rel_xy_b[..., 1], rel_xy_b[..., 0]) + 2 * torch.pi) % (2 * torch.pi)   # (N,M)
+        sector_idx = torch.clamp((ang / (2 * torch.pi) * K).long(), 0, K - 1)                     # (N,M)
+
+        # we want per (n, sector) the min of clear_pos[n, m where sector_idx==sector]
+        # Approach A: torch.scatter_reduce (PyTorch >=2.0) with amin
+        sector_mins = None
+        if hasattr(torch.Tensor, "scatter_reduce"):
+            # init with +inf, then amin-reduce
+            sector_mins = torch.full((N, K), float("inf"), device=device, dtype=clear_pos.dtype)
+            # flatten (N,M) -> (N*M,)
+            base = torch.arange(N, device=device).unsqueeze(1).expand(N, M) * K
+            flat_indices = (base + sector_idx).reshape(-1)                 # (N*M,)
+            values = clear_pos.reshape(-1)                                  # (N*M,)
+
+            # fused reduce on a flat (N*K,) then reshape back
+            flat_mins = torch.full((N * K,), float("inf"), device=device, dtype=values.dtype)
+            flat_mins.scatter_reduce_(0, flat_indices, values, reduce="amin", include_self=True)
+            sector_mins = flat_mins.view(N, K)
+        else:
+            # Approach B (fallback): one-hot mask (N,K,M), masked min
+            # Create (N,M,K) mask via one-hot, then move to (N,K,M)
+            oh = torch.nn.functional.one_hot(sector_idx, num_classes=K).to(clear_pos.dtype)  # (N,M,K)
+            mask = oh.permute(0, 2, 1)                                                       # (N,K,M)
+            # masked values: where mask=1 -> clear_pos; else +inf
+            vals = torch.where(mask.bool(),
+                                clear_pos.unsqueeze(1).expand(-1, K, -1),
+                                torch.full((N, K, M), float("inf"), device=device, dtype=clear_pos.dtype))
+            sector_mins = torch.min(vals, dim=2).values                                      # (N,K)
+
+        # clamp & normalize
+        sector_mins = torch.clamp(sector_mins, max=range_max) / range_max                    # (N,K) in [0,1]
+        out["sector_mins_norm"] = sector_mins
+
+    return out
