@@ -343,7 +343,7 @@ class RigidLink(RBC):
                     tensor[i_b, i_v - self._vvert_start, j] = vvert_pos[j]
 
     @gs.assert_built
-    def get_aabb(self):
+    def get_AABB(self):
         """
         Get the axis-aligned bounding box (AABB) of the link's collision body in the world frame by aggregating all
         the collision geometries associated with this link (`link.geoms`).
@@ -357,7 +357,7 @@ class RigidLink(RBC):
         Set the mass of the link.
         """
         if self.is_fixed:
-            gs.warning(f"Updating the mass of a link that is fixed wrt world has no effect, skipping.")
+            gs.logger.warning(f"Updating the mass of a link that is fixed wrt world has no effect, skipping.")
             return
 
         if mass < gs.EPS:
