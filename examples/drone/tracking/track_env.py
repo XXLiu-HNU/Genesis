@@ -7,7 +7,6 @@ import torch
 import math
 import copy
 import yaml
-from Genesis.examples.drone.tracking.depth_reward_test.test2 import H
 import genesis as gs
 from pid import PIDcontroller
 from odom import Odom
