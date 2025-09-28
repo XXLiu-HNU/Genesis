@@ -38,8 +38,8 @@ class TrackerEnv:
         self.num_privileged_obs = None
         self.num_actions = env_cfg["num_actions"]
         self.device = gs.device
-        self.od_min_sq = 1.0*1.0
-        self.od_max_sq = 3.0*3.0
+        self.od_min_sq = 1.0
+        self.od_max_sq = 3.0
 
         self.simulate_action_latency = env_cfg["simulate_action_latency"]
         self.dt = 0.01  # run in 100hz
@@ -229,8 +229,6 @@ class TrackerEnv:
 
         self.rel_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.world_rel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
-        self.hor_dist = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        self.ver_dist = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
@@ -423,10 +421,6 @@ class TrackerEnv:
         self.rel_vel = relative_velocity_body(self.tracker_lin_vel, self.target_lin_vel, self.tracker_quat)
         self.world_rel = self.target_pos - self.tracker_pos
 
-        self.hor_dist = torch.sum(torch.square(self.world_rel[:, :2]), dim=1)
-        self.ver_dist = torch.abs(self.world_rel[:, 2])
-
-        
         # shape == (n_envs,7) -> [x_w(3), z_w(3), cos_upright(1)]
 
         # check termination and reset
@@ -497,21 +491,43 @@ class TrackerEnv:
 
         # 2) 正确缩放 last_actions：角速度/推力分开
         #    假定 self.last_actions: (N,4) -> [p_cmd, q_cmd, r_cmd, T_cmd]
-        ang_prev = torch.clamp(self.last_actions[:, :3] , -1.0, 1.0)     # (N,3)
-        thrust_prev = torch.clamp(self.last_actions[:, 3:4] , 0.0, 1.0)  # (N,1)
+        eps = 1e-6
+        N = self.rel_pos.size(0)
 
-        hor_dist_feat = torch.clamp(self.hor_dist, min=0.0, max=5.0)
-        ver_dist_feat = torch.clamp(self.ver_dist, min=0.0, max=5.0)
-        # 4) 主观测拼装（与原缩放风格一致）
+        # ---- 水平/垂直距离（世界语义），但全部在机体系里算 ----
+        # R_bw: world->body
+        R_bw = quat_to_rotmat(self.tracker_quat)                        # (N,3,3)
+        # 世界 up=[0,0,1] 在机体系中的方向
+        ez_w = torch.tensor([0.,0.,1.], device=self.rel_pos.device, dtype=self.rel_pos.dtype).expand(N,3)
+        z_hat_b = torch.bmm(R_bw, ez_w.unsqueeze(-1)).squeeze(-1)       # (N,3), 单位向量
+
+        # rel_pos 是机体系 target - tracker
+        rel_vert = torch.sum(self.rel_pos * z_hat_b, dim=-1, keepdim=True)             # (N,1)
+        rel_horiz_vec = self.rel_pos - rel_vert * z_hat_b                               # (N,3)
+        hor_dist = torch.norm(rel_horiz_vec, dim=-1, keepdim=True)                      # (N,1)  ≥0
+        ver_dist = torch.abs(rel_vert)                                                  # (N,1)  ≥0
+
+        # 归一化到 [0,1] —— 用你的工作半径/范围
+        HORIZ_WORK_RADIUS = 5.0   # 你原来 clamp 的 5.0，建议设成成员变量
+        VERT_WORK_RANGE   = 5.0
+
+        hor_dist_norm = torch.clamp(hor_dist / HORIZ_WORK_RADIUS, 0.0, 1.0)             # (N,1)
+        ver_dist_norm = torch.clamp(ver_dist / VERT_WORK_RANGE,   0.0, 1.0)             # (N,1)
+
+        # ---- 上一步动作（各自正确缩放；如果你的 last_actions 已经是归一化到 [-1,1]/[0,1]，可保留）
+        ang_prev    = torch.clamp(self.last_actions[:, :3], -1.0, 1.0)                  # (N,3)
+        thrust_prev = torch.clamp(self.last_actions[:, 3:4], 0.0, 1.0)                  # (N,1)
+
+        # ---- 主观测拼装 ----
         self.obs_buf = torch.cat([
-            torch.clamp(self.rel_pos * self.obs_scales["max_diff"], -1.0, 1.0),       # (N,3)  机体系相对位置
-            torch.clamp(self.rel_vel * self.obs_scales["max_lin"], -1.0, 1.0),        # (N,3)  机体系相对速度
-            torch.clamp(self.tracker_ang_vel * self.obs_scales["max_ang"], -1.0, 1.0),# (N,3)  自身角速度（机体系）
-            ang_prev, thrust_prev,                                                     # (N,3)+(N,1)
-            ori_feat,                                                                  # (N,7)  [x_w(3), z_w(3), cos_upright(1)]
-            obs_env,                                                                   # (N, 5+K)
-            hor_dist_feat * self.obs_scales["max_diff"],
-            ver_dist_feat * self.obs_scales["max_diff"],
+            torch.clamp(self.rel_pos * self.obs_scales["max_diff"], -1.0, 1.0),         # (N,3)
+            torch.clamp(self.rel_vel * self.obs_scales["max_lin"],  -1.0, 1.0),         # (N,3)
+            torch.clamp(self.tracker_ang_vel * self.obs_scales["max_ang"], -1.0, 1.0),  # (N,3)
+            ang_prev, thrust_prev,                                                       # (N,3)+(N,1)
+            ori_feat,                                                                    # (N,7)
+            obs_env,                                                                     # (N, 5+K)
+            hor_dist_norm,                                                               # (N,1)
+            ver_dist_norm,                                                               # (N,1)
         ], dim=-1)
 
         self.last_actions[:] = self.actions[:]
@@ -774,42 +790,47 @@ class TrackerEnv:
         return crash_rew
     
     def _reward_distance_horizontal(self):
-        
-        # 限制在合理范围，避免数值爆炸
-        horizontal_dist_sq = torch.clamp(self.hor_dist, min=0.0, max=25.0)
-        
-        # 创建掩码：判断距离是否在[od_min_sq, od_max_sq]范围内
-        in_range = (horizontal_dist_sq >= self.od_min_sq) & (horizontal_dist_sq <= self.od_max_sq)
-        
-        # 对于超出范围的部分计算惩罚
-        # 小于最小值的惩罚
-        penalty_below = torch.clamp(self.od_min_sq - horizontal_dist_sq, min=0.0)** 2
-        # 大于最大值的惩罚
-        penalty_above = torch.clamp(horizontal_dist_sq - self.od_max_sq, min=0.0)**2
-        
-        # 总惩罚（只对超出范围的部分）
+        """
+        目标：水平距离 d ∈ [d_min, d_max] 最佳；区间内给常数奖励，区间外按二次误差惩罚。
+        假设：self.world_rel = target_pos - tracker_pos （世界系，单位 m）
+            self.od_min, self.od_max 以“米”为单位（而不是平方）
+        """
+        eps = 1e-6
+        # 1) 水平线性距离（米）
+        d2 = torch.sum(self.world_rel[:, :2]**2, dim=1)                 # (N,)
+        d  = torch.sqrt(torch.clamp(d2, min=0.0) + eps)                  # (N,)
+
+        # 2) 区间判定（单位：米）
+        d_min = self.od_min
+        d_max = self.od_max
+
+        in_range = (d >= d_min) & (d <= d_max)
+
+        # 3) 区间外二次惩罚（更稳定的梯度）
+        penalty_below = torch.clamp(d_min - d, min=0.0)**2
+        penalty_above = torch.clamp(d - d_max, min=0.0)**2
         total_penalty = penalty_below + penalty_above
-        
-        # 初始化奖励：范围内的给予固定奖励，范围外的为负惩罚
-        reward = torch.where(in_range, 
-                            torch.tensor(1.0, device=horizontal_dist_sq.device),  # 固定奖励值
-                            -total_penalty)  # 范围外的惩罚
-        
-        # 最终限幅，确保奖励在合理区间
-        reward = torch.clamp(reward, min=-100.0, max=1.0)  # 最大值调整为固定奖励值
-        
+
+        # 4) 组装
+        reward_in   = torch.ones_like(d)                                 # 区间内固定奖励
+        reward_out  = -total_penalty
+        reward = torch.where(in_range, reward_in, reward_out)
+
+        # 5) 限幅
+        reward = torch.clamp(reward, min=-100.0, max=1.0)
         return reward
+
     
     def _reward_distance_vertical(self):
         """
         对垂直方向的距离进行奖励。
         垂直距离为0时获得最大奖励1.0，垂直距离增加时奖励递减。
         """
-        
         # ! 1. 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
         # sigma控制奖励随距离衰减的速度，可以根据实际需求调整
+        ver_dist = torch.abs(self.world_rel[:, 2])  # 垂直距离，单位米
         sigma = 0.5
-        reward = torch.exp(-0.5 * (self.ver_dist / sigma)**2)
+        reward = torch.exp(-0.5 * (ver_dist / sigma)**2)
         
         return reward
 
