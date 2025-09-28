@@ -839,8 +839,8 @@ class TrackerEnv:
         对速度超过物理极限的行为进行惩罚。
         使用指数函数对超速进行强力惩罚。
         """
-        # 无人机线速度存储在 self.tracker_lin_vel 中
-        speed_norm = torch.norm(self.tracker_lin_vel, dim=-1)
+        # 假设你的无人机线速度存储在 self.tracker_lin_vel 中
+        speed_norm = torch.norm(self.actions, dim=-1)
 
         # ! 定义最大允许速度，例如 5 m/s
         max_speed = 5.0
