@@ -7,6 +7,7 @@ import torch
 import math
 import copy
 import yaml
+from Genesis.examples.drone.tracking.depth_reward_test.test2 import H
 import genesis as gs
 from pid import PIDcontroller
 from odom import Odom
@@ -228,6 +229,9 @@ class TrackerEnv:
         self.initial_angle = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         self.rel_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.world_rel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.hor_dist = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+        self.ver_dist = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
@@ -418,6 +422,10 @@ class TrackerEnv:
         # self.rel_pos = self.target_pos - self.tracker_pos
         self.rel_pos = relative_position_body(self.tracker_pos, self.tracker_quat,self.target_pos)
         self.rel_vel = relative_velocity_body(self.tracker_lin_vel, self.target_lin_vel, self.tracker_quat)
+        self.world_rel = self.target_pos - self.tracker_pos
+
+        self.hor_dist = torch.sum(torch.square(self.world_rel[:, :2]), dim=1)
+        self.ver_dist = torch.abs(self.world_rel[:, 2])
 
         
         # shape == (n_envs,7) -> [x_w(3), z_w(3), cos_upright(1)]
@@ -491,8 +499,10 @@ class TrackerEnv:
         # 2) 正确缩放 last_actions：角速度/推力分开
         #    假定 self.last_actions: (N,4) -> [p_cmd, q_cmd, r_cmd, T_cmd]
         ang_prev = torch.clamp(self.last_actions[:, :3] , -1.0, 1.0)     # (N,3)
-        thrust_prev = torch.clamp(self.last_actions[:, 3:4] , -1.0, 1.0)  # (N,1)
+        thrust_prev = torch.clamp(self.last_actions[:, 3:4] , 0.0, 1.0)  # (N,1)
 
+        hor_dist_feat = torch.clamp(self.hor_dist, min=0.0, max=5.0)
+        ver_dist_feat = torch.clamp(self.ver_dist, min=0.0, max=5.0)
         # 4) 主观测拼装（与原缩放风格一致）
         self.obs_buf = torch.cat([
             torch.clamp(self.rel_pos * self.obs_scales["max_diff"], -1.0, 1.0),       # (N,3)  机体系相对位置
@@ -501,6 +511,8 @@ class TrackerEnv:
             ang_prev, thrust_prev,                                                     # (N,3)+(N,1)
             ori_feat,                                                                  # (N,7)  [x_w(3), z_w(3), cos_upright(1)]
             obs_env,                                                                   # (N, 5+K)
+            hor_dist_feat * self.obs_scales["max_diff"],
+            ver_dist_feat * self.obs_scales["max_diff"],
         ], dim=-1)
 
         self.last_actions[:] = self.actions[:]
@@ -763,11 +775,9 @@ class TrackerEnv:
         return crash_rew
     
     def _reward_distance_horizontal(self):
-        # 计算水平距离的平方
-        horizontal_dist_sq = torch.sum(torch.square(self.rel_pos[:, :2]), dim=1)
         
         # 限制在合理范围，避免数值爆炸
-        horizontal_dist_sq = torch.clamp(horizontal_dist_sq, min=0.0, max=25.0)
+        horizontal_dist_sq = torch.clamp(self.hor_dist, min=0.0, max=25.0)
         
         # 创建掩码：判断距离是否在[od_min_sq, od_max_sq]范围内
         in_range = (horizontal_dist_sq >= self.od_min_sq) & (horizontal_dist_sq <= self.od_max_sq)
@@ -796,13 +806,11 @@ class TrackerEnv:
         对垂直方向的距离进行奖励。
         垂直距离为0时获得最大奖励1.0，垂直距离增加时奖励递减。
         """
-        # ! 1. 获取垂直方向的距离（取绝对值）
-        vertical_dist = torch.abs(self.rel_pos[:, 2])
         
-        # ! 2. 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
+        # ! 1. 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
         # sigma控制奖励随距离衰减的速度，可以根据实际需求调整
         sigma = 0.5
-        reward = torch.exp(-0.5 * (vertical_dist / sigma)**2)
+        reward = torch.exp(-0.5 * (self.ver_dist / sigma)**2)
         
         return reward
 
