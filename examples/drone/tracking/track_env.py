@@ -1,7 +1,3 @@
-# TODO 设计奖励函数。
-# 实现目标的稳定跟踪
-# 增加课程学习 
-
 import os
 import torch
 import math
@@ -38,11 +34,11 @@ class TrackerEnv:
         self.num_privileged_obs = None
         self.num_actions = env_cfg["num_actions"]
         self.device = gs.device
-        self.od_min = 1.0
-        self.od_max = 3.0
+        self.od_min = 1.0                                                               # minimum distance for observation
+        self.od_max = 3.0                                                               # maximum distance for observation
 
         self.simulate_action_latency = env_cfg["simulate_action_latency"]
-        self.dt = 0.01  # run in 100hz
+        self.dt = 0.01                                                                  # run in 100hz
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
 
         self.env_cfg = env_cfg
@@ -59,7 +55,6 @@ class TrackerEnv:
             nav_cfg = yaml.safe_load(f)
 
         def cfg(path, default=None):
-            # 轻量 get：path 形如 "world.xy_min"
             cur = nav_cfg
             for k in path.split("."):
                 if not isinstance(cur, dict) or k not in cur:
@@ -67,7 +62,7 @@ class TrackerEnv:
                 cur = cur[k]
             return cur
         
-        # 基本参数
+        # parameters from config file
         self.drone_height = float(cfg("drone.height", 1.0))
         self.world_xy_min = tuple(cfg("world.xy_min", [-10.0, -10.0]))
         self.world_xy_max = tuple(cfg("world.xy_max", [ 10.0,  10.0]))
@@ -75,17 +70,17 @@ class TrackerEnv:
         self.drone_radius  = float(cfg("drone.radius", 0.12))
         self.safety_margin = float(cfg("safety.margin", 0.12))
 
-        # 规划/鲁棒性参数（从 cfg 读取）
+        #  planning parameters
         self.max_replan_tries = int(cfg("planner.max_replan_tries", 8))
         self.goals_per_try    = int(cfg("planner.goals_per_try", 5))
 
 
-        # inflation：默认 & 最小（派生量）
+        # inflation
         self.inflation_default = self.drone_radius + self.safety_margin
         self.inflation_min     = self.drone_radius + float(cfg("planner.inflation_min_addon", 0.06))
-        self.inflation         = self.inflation_default  # 当前使用的 inflation，可在重试中调整
+        self.inflation         = self.inflation_default
 
-        # follower 参数
+        # follower parameters
         self.v_max          = float(cfg("follower.v_max", 0.6))
         self.a_max          = float(cfg("follower.a_max", 1.2))
         self.warmup_time    = float(cfg("follower.warmup_time", 2.5))
@@ -163,13 +158,13 @@ class TrackerEnv:
         self.scene.build(n_envs=num_envs)
 
 
-        # 先把 obstacle/边界搬到 CPU numpy，避免重复 to('cpu')
+        # move obstacle to CPU numpy array, because is more efficient to build roadmap on CPU
         self.obs_xy_cpu_np = self.obs_xy.detach().to("cpu", copy=True).numpy().astype(np.float32)
         self.obs_r_cpu_np  = self.obs_r.detach().to("cpu", copy=True).numpy().astype(np.float32)
 
-        # ===== 引入 Roadmap =====
+        # =====  Roadmap =====
 
-        # 参数可按场景微调
+        # roadmap parameters
         self.prm_num_nodes   = 1500
         self.prm_k_neighbors = 12
         self.prm_max_edge    = 2.5
@@ -193,9 +188,9 @@ class TrackerEnv:
 
         from collections import deque
 
-        self.replan_queue = deque()   # FIFO 队列存 env_id
-        self.replan_inqueue = set()   # 去重
-        self.max_plan_per_step = 32   # 每帧最多处理的规划请求数（可调/自适应）
+        self.replan_queue = deque()
+        self.replan_inqueue = set()   # remove same env_id in queue
+        self.max_plan_per_step = 32   # max per step
 
 
         # ! Prepare reward functions and multiply reward scales by dt
@@ -234,9 +229,9 @@ class TrackerEnv:
 
     def plan_new_mission(self, envs_idx):
         """
-        为指定的 envs 重新规划 target 的轨迹
+        for single env in envs_idx, re-plan the target's trajectory
         """
-        # 统一把 envs_idx 变成 Python 列表
+        # change envs_idx to Python list
         if isinstance(envs_idx, torch.Tensor):
             envs_idx = envs_idx.tolist()
         elif not isinstance(envs_idx, (list, tuple)):
@@ -245,15 +240,15 @@ class TrackerEnv:
         with torch.no_grad():
 
             for env_id in envs_idx:
-                # 当前起点（世界坐标）
+                # current start point (world coordinate)
                 cur = self.target.get_pos()[env_id]
                 start_xy = (cur[0].item(), cur[1].item())
 
                 path_found, chosen_goal, chosen_path = False, None, None
 
-                # 逐步放宽（注意：使用 cached 网格时，放宽参数不会改变已缓存网格，仅改变采样与重试策略）
+                # increase inflation
                 for attempt in range(self.max_replan_tries):
-                    # 多采几个目标点以增加成功率
+                    # sample more goals to increase success rate
                     goals_xy = []
                     for _ in range(self.goals_per_try):
                         g = sample_free_xy(
@@ -266,7 +261,7 @@ class TrackerEnv:
                             g = (float(g[0].item()), float(g[1].item()))
                         goals_xy.append(g)
 
-                    # 一次性查询（命中任一目标即返回路径）
+                    # once query, if found, break
                     path_np = self.roadmap.query(start_xy, goals_xy, k_attach=8)
                     if path_np is not None and path_np.shape[0] >= 2:
                         chosen_path = [(float(x), float(y)) for (x, y) in path_np.tolist()]
@@ -275,11 +270,11 @@ class TrackerEnv:
                         break
 
                 if path_found:
-                    # 成功：写回该 env 的目标与路径
+                    # if success, return the goal and path
                     self.goal_xy[env_id]  = chosen_goal
                     self.path_wps[env_id] = chosen_path
 
-                    # follower：按 env 独立创建/重置
+                    # follower： reset or create new
                     if self.followers[env_id] is None:
                         self.followers[env_id] = PathFollower(
                             chosen_path, self.dt,
@@ -292,7 +287,7 @@ class TrackerEnv:
                         self.followers[env_id].reset_with_path(chosen_path)
 
                 else:
-                    # 失败：不要 raise，悬停 + 下次再试
+                    # if fail, hold position and try next time
                     print(f"[Planner] WARNING: env {env_id} no path found, holding position.")
                     hold_xy = start_xy
                     self.goal_xy[env_id]  = hold_xy
@@ -349,32 +344,32 @@ class TrackerEnv:
         ref_pos[:, 2] = self.drone_height
         ref_pos[:, 3] = 0.0
 
-        # 1) 收集有路径跟随器的 env 索引
+        # 1) collect envs with followers
         has_follower = [i for i in range(self.num_envs) if self.followers[i] is not None]
         M = len(has_follower)
 
         if M > 0:
-            # 2) 批量调用 step
+            # 2) batch step followers
             next_list = [self.followers[i].step() for i in has_follower]   # List[(x,y)]
 
-            # 3) 只写入 x,y，不覆盖 z
+            # 3) only update x,y of ref_pos, keep z and yaw as default
             next_xy = torch.tensor(next_list, device=self.device, dtype=gs.tc_float)  # (M,2)
             idx = torch.tensor(has_follower, device=self.device, dtype=torch.long)
             ref_pos[idx, 0:2] = next_xy
 
-            # 4) 批量判断 reached_goal
+            # 4) batch check reached_goal
             reached = [i for i in has_follower if self.followers[i].reached_goal(thresh=self.goal_reach_thresh)]
             for env_id in reached:
                 if env_id not in self.replan_inqueue:
                     self.replan_queue.append(env_id)
                     self.replan_inqueue.add(env_id)
 
-        # 5) 没有 follower 的 env：保持当前位置
+        # 5) if not reached goal, hold position
         no_follower_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         if M > 0:
             no_follower_mask[idx] = False
         if no_follower_mask.any():
-            ref_pos[no_follower_mask, :3] = cur_pos[no_follower_mask]  # 保持原位置 (x,y,z)
+            ref_pos[no_follower_mask, :3] = cur_pos[no_follower_mask]  # keep position (x,y,z)
             ref_pos[no_follower_mask, 3]  = 0.0
 
 
@@ -416,9 +411,11 @@ class TrackerEnv:
         self.target_ang_vel[:] = transform_by_quat(self.target.get_ang(), inv_target_quat)
 
         # check termination and reset
-        # 判断终止条件
-        # 1. 无人机发生碰撞
-        # 2. 目标无人机丢失
+        # 1. if drone is in collision
+        # 2. if target is lost
+        # 3. if drone attitude exceeds max angle
+        # 4. if drone is close to ground
+        # 5. if drone is out of range
         
         # ! -------------------------- check termination and reset --------------------------
         collision_flag = self._collision_detect()
@@ -456,8 +453,8 @@ class TrackerEnv:
                 tracker_pos_w=self.tracker_pos,
                 tracker_quat=self.tracker_quat,
                 tracker_lin_vel_w=self.tracker_lin_vel,
-                obs_xy_w=self.obs_xy,      # (N,M,2) 或 (M,2)
-                obs_r=self.obs_r,          # (N,M,1) 或 (M,1)
+                obs_xy_w=self.obs_xy,      # (N,M,2) or (M,2)
+                obs_r=self.obs_r,          # (N,M,1) or (M,1)
                 range_max=20.0,
                 ttc_max=5.0,
                 K=8,
@@ -469,7 +466,7 @@ class TrackerEnv:
             feats["ttc_min_norm"],
             feats["mean_clear_norm"],
             feats["heading_clear_norm"],
-            feats["sector_mins_norm"],   # 若 K>0
+            feats["sector_mins_norm"],   # if K>0
         ], dim=-1)                       # (N, 4+3+4+1+1+K)
         self.obs_buf = torch.cat(
             [
@@ -600,7 +597,7 @@ class TrackerEnv:
         return self.obs_buf, None
 
     def _drain_replan_queue(self, budget=None):
-        """每帧消化最多 budget 个规划请求"""
+        """Drains the replan queue and processes planning requests."""
         if budget is None:
             budget = self.max_plan_per_step
 
@@ -613,7 +610,7 @@ class TrackerEnv:
             budget -= 1
 
         if batch:
-            # 用你已经实现的批量规划（或 roadmap.query 逐个）
+            # use batch planning
             self.plan_new_mission_batch(batch, max_plan_per_step=len(batch))
 
     def plan_new_mission_batch(self, envs_idx, max_plan_per_step=16):
@@ -624,16 +621,15 @@ class TrackerEnv:
         if len(envs_idx) == 0:
             return
 
-        # 节流：每步只处理部分 env，避免突刺
         envs_idx = envs_idx[:max_plan_per_step]
 
-        # 1) 批量取起点
+        # 1) batch get start position
         cur_pos = self.target.get_pos()   # [N,3]
         starts_xy = [(float(cur_pos[i,0].item()), float(cur_pos[i,1].item())) for i in envs_idx]
 
-        # 2) 为这一批 env 共享一套候选目标（减少采样 & KNN 次数）
+        # 2) batch sample goals
         goals_xy_shared = []
-        for _ in range(max(8, self.goals_per_try)):  # 稍微多采一点，共享
+        for _ in range(max(8, self.goals_per_try)):
             g = sample_free_xy(self.world_xy_min, self.world_xy_max,
                             self.obs_xy, self.obs_r,
                             safe_radius=self.prm_clearance, device=self.device)
@@ -641,11 +637,11 @@ class TrackerEnv:
                 g = (float(g[0].item()), float(g[1].item()))
             goals_xy_shared.append(g)
 
-        # 3) 逐起点跑一次 query（但共享目标 & KNN 索引）
+        # 3) batch query path for each start position
         for idx, env_id in enumerate(envs_idx):
             start_xy = starts_xy[idx]
             chosen_path = None
-            # 先试直线可达（批量目标里命中概率很高）
+            # Try line of sight first
             los_hits = [g for g in goals_xy_shared
                         if _line_of_sight_free(
                             np.asarray(start_xy, np.float32),
@@ -654,7 +650,7 @@ class TrackerEnv:
             if len(los_hits) > 0:
                 chosen_path = np.asarray([start_xy, los_hits[0]], dtype=np.float32)
             else:
-                # 再 PRM 查询
+                # PRM query
                 chosen_path = self.roadmap.query(start_xy, goals_xy_shared, k_attach=8)
 
             if chosen_path is not None and chosen_path.shape[0] >= 2:
@@ -672,7 +668,7 @@ class TrackerEnv:
                 else:
                     self.followers[env_id].reset_with_path(self.path_wps[env_id])
             else:
-                # 兜底：悬停
+                # For the worst case, hold position and try next time
                 hold_xy = start_xy
                 self.goal_xy[env_id]  = hold_xy
                 self.path_wps[env_id] = [hold_xy, hold_xy]
@@ -732,36 +728,35 @@ class TrackerEnv:
 
     def _reward_distance_horizontal(self):
         """
-        k: 边界软化强度（越大越像硬边界），推荐 10~50
-        center_weight: 区间内对齐中心的轻微奖励权重（0 表示只做软边界不拉中心）
+        k: Softening factor for the boundary (larger values mean softer boundaries), recommended 10~50
         """
         k=20.0
         eps=1e-8
         horiz = self.rel_pos[..., :2]
         d = torch.sqrt(torch.sum(horiz * horiz, dim=-1) + eps)
 
-        # 软惩罚：softplus( k*(d_min - d) ) 只在 d<d_min 时显著；另一侧同理
+        # softplus( k*(d_min - d) ), only penalize outside the range
         penalty_below = torch.nn.functional.softplus(k * (self.od_min - d)) / k
         penalty_above = torch.nn.functional.softplus(k * (d - self.od_max)) / k
-        soft_barrier = penalty_below + penalty_above           # 平滑、处处可微
+        soft_barrier = penalty_below + penalty_above
 
-        # 组合；负号表示惩罚（值越小越差）
+        # use negative cost as reward
         reward = -(soft_barrier )
 
-        # 平滑压缩，避免数值过大；不要用硬 clamp
+        # use tanh for smooth
         reward = torch.tanh(reward)
         return reward
     
     def _reward_distance_vertical(self):
         """
-        对垂直方向的距离进行奖励。
-        垂直距离为0时获得最大奖励1.0，垂直距离增加时奖励递减。
+        Soft reward for vertical distance.
+        Vertical distance of 0 gives maximum reward 1.0, and vertical distance increases reward decreases.
         """
-        # ! 1. 获取垂直方向的距离（取绝对值）
+        # ! 1. get the vertical distance (absolute value)
         vertical_dist = torch.abs(self.rel_pos[:, 2])
         
-        # ! 2. 使用高斯奖励函数，当垂直距离为0时获得最大奖励1.0
-        # sigma控制奖励随距离衰减的速度，可以根据实际需求调整
+        # ! 2. use gaussian reward function, when vertical distance is 0, get maximum reward 1.0
+        # sigma controls the rate of decay of reward with vertical distance, adjust as needed
         sigma = 0.5
         reward = torch.exp(-0.5 * (vertical_dist / sigma)**2)
         
@@ -769,44 +764,43 @@ class TrackerEnv:
 
     def _reward_max_speed(self):
         """
-        指数型超速代价：c_m = exp(max(0, ||v|| - v_max)) - 1 >= 0
-        配合负权重 (e.g., -0.5) 使用。
+        max speed cost: c_m = exp(max(0, ||v|| - v_max)) - 1 >= 0 
+        use negative weight (e.g., -0.5) for this cost.
         """
-        # 线速度范数（世界系）
+        # ! 1. get the linear speed norm (world frame)
         speed_norm = torch.norm(self.tracker_lin_vel, dim=-1)
         v_max = 5.0
 
         exceed = torch.clamp(speed_norm - v_max, min=0.0)
-        # 使用 expm1 提高数值稳定性：expm1(x) = exp(x) - 1
-        cost = torch.expm1(exceed)   # >= 0，超速为0时正好等于0
+        # ! 2. use expm1 for numerical stability：expm1(x) = exp(x) - 1
+        cost = torch.expm1(exceed)   # >= 0, when speed is 0, cost is 0
         return cost
 
     def _reward_visibility_dir(self):
         """
-        计算并奖励无人机朝向与目标运动方向及相对位置的对齐程度。
+        reward for visibility of direction and position.
         """
-        # 获取追踪无人机在世界坐标系下的朝向向量
-        # 假设无人机机头方向为 body-frame 的 x 轴
+        # get the forward vector of the tracker drone in world frame
+        # assume the forward direction of the tracker drone is the x axis of body frame
         forward_vec_body = torch.tensor([1.0, 0, 0], device=self.device).expand(self.num_envs, -1)
         forward_vec_world = transform_by_quat(forward_vec_body, self.tracker_quat)
 
-        # ! 1. 计算第一个奖励项：运动方向对齐
-        # 获取目标无人机在世界坐标系下的运动方向向量
+        # ! 1. reward for visibility of direction
+        # get the velocity vector of the target drone in world frame
         target_vel = self.target.get_vel()
         vel_norm = torch.norm(target_vel, dim=-1, keepdim=True)
         epsilon = 1e-6
         target_vel_normalized = target_vel / (vel_norm + epsilon)
         reward_direction = torch.sum(forward_vec_world * target_vel_normalized, dim=-1)
 
-        # ! 2. 计算第二个奖励项：空间位置朝向对齐
-        # 获取指向目标的方向向量
+        # ! 2. reward for visibility of position
+        # get the direction vector to the target drone in world frame
         direction_to_target = self.rel_pos
         pos_norm = torch.norm(direction_to_target, dim=-1, keepdim=True)
         direction_to_target_normalized = direction_to_target / (pos_norm + epsilon)
         reward_yaw = torch.sum(forward_vec_world * direction_to_target_normalized, dim=-1)
 
-        # ! 3. 定义权重。你可以根据需要调整这些值。
-        # 例如，如果运动方向的对齐更重要，可以增加 w_direction 的值。
+        # ! 3. define weights
         w_direction = 0.5
         w_yaw = 0.5
         visibility_reward = w_direction * reward_direction + w_yaw * reward_yaw
@@ -815,7 +809,7 @@ class TrackerEnv:
     
     def _reward_visibility_obs(self):
         """
-        计算并奖励无人机朝向与目标运动方向及相对位置的对齐程度。
+        reward for visibility of obstacles.
         """
         params = Params2D(alpha=8.0, dt=self.dt, H=8, w_v=0.7, w_tto=0.3)
         out = visibility_and_tto_2d(self.obs_xy, self.obs_r, self.target_pos[:,:2], self.target_lin_vel[:,:2], self.tracker_pos[:,:2], self.tracker_lin_vel[:,:2], params)
