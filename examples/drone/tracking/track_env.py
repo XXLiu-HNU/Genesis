@@ -13,7 +13,7 @@ from genesis.utils.geom import (
     inv_quat,
     transform_quat_by_quat,
 )
-from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles, obstacle_features
+from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles, obstacle_features, collision_reward
 
 from depth_visibility_2d import visibility_and_tto_2d, Params2D
 
@@ -24,7 +24,7 @@ from roadmap import Roadmap,_line_of_sight_free
 
 import numpy as np
 
-import time
+from genesis.sensors.raycaster.patterns import DepthCameraPattern
 
 class TrackerEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False):
@@ -89,6 +89,10 @@ class TrackerEnv:
         self.min_lookahead  = float(cfg("follower.min_lookahead", 0.12))
         self.goal_reach_thresh = float(cfg("follower.goal_reach_thresh", 0.12))
 
+        # camera parameters
+        self.width = 64 
+        self.height = 48
+
         # ! Create scene
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
@@ -127,6 +131,17 @@ class TrackerEnv:
         self.tracker_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.tracker_inv_init_quat = inv_quat(self.tracker_init_quat)
         self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/tracker_drone_urdf/drone.urdf"))
+
+        # # ! Add Tracker Sensor
+        # sensor_kwargs = dict(
+        #     entity_idx=self.tracker.idx,
+        #     pos_offset=(0.0, 0.0, 0.0),
+        #     euler_offset=(0.0, 0.0, 0.0),
+        #     return_world_frame=True,
+        #     draw_debug=True,
+        # )
+        # res = ( self.width, self.height)
+        # self.tracker_sensor = self.scene.add_sensor(gs.sensors.DepthCamera(pattern=DepthCameraPattern(res=res), **sensor_kwargs))
 
         # ! Add Traget
         self.target_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
@@ -226,6 +241,8 @@ class TrackerEnv:
 
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
+
+        # self.images = torch.zeros((self.num_envs, self.height, self.width), device=gs.device, dtype=gs.tc_float)
 
     def plan_new_mission(self, envs_idx):
         """
@@ -329,6 +346,8 @@ class TrackerEnv:
         Args:
             actions (torch.Tensor): The actions to be applied to the environment.
         """
+
+        # self.images[:] = self.tracker_sensor.read_image()
         # ! -------------------------- apply actions --------------------------
         self.actions = actions
         exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
@@ -726,6 +745,15 @@ class TrackerEnv:
         crash_rew[self.crash_condition] = 1
         return crash_rew
 
+    def _reward_collision(self):
+
+        out = collision_reward(
+            tracker_pos=self.tracker_pos[:,:2],     # [N,dim]
+            tracker_vel=self.tracker_lin_vel[:,:2],     # [N,dim]
+            obs_centers=self.obs_xy,     # [M,dim]
+            obs_radii=self.obs_r,         # [M] or [M,1]
+        )
+        return out["rc"]
     def _reward_distance_horizontal(self):
         """
         k: Softening factor for the boundary (larger values mean softer boundaries), recommended 10~50

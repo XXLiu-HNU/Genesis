@@ -102,6 +102,7 @@ def get_cfgs():
 
     reward_cfg = {
         "reward_scales": {
+            "collision": - 1.0,
             "distance_horizontal": 1.0,
             "distance_vertical": 1.0,
             "smooth": -0.1,

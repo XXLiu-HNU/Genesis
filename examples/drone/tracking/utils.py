@@ -1,6 +1,7 @@
 import torch
 import genesis as gs
 from typing import Literal, Tuple, Dict
+import torch.nn.functional as F
 
 # ---------- 小工具 ----------
 def _to_xy(p: torch.Tensor) -> torch.Tensor:
@@ -394,3 +395,69 @@ def obstacle_features(
         out["sector_mins_norm"] = sector_mins
 
     return out
+def collision_reward(
+    tracker_pos: torch.Tensor,   # [N,dim]
+    tracker_vel: torch.Tensor,   # [N,dim]
+    obs_centers: torch.Tensor,   # [M,dim]
+    obs_radii: torch.Tensor,     # [M] or [M,1]
+    d_s=0.5,                     # 可以是 float/int/tuple/list/tensor；支持标量或 [N]
+    beta1: float = 1.0,
+    beta2: float = 10.0,
+    eps: float = 1e-9,
+):
+    """
+    返回：
+      rc:      [N] 惩罚（越大越危险）
+      d_t:     [N] 最近障碍边界净空
+      dtdot:   [N] 净空的时间导数（>0 远离，<0 接近）
+      idx:     [N] 最近障碍索引
+    """
+    device = tracker_pos.device
+    dtype  = tracker_pos.dtype
+    N      = tracker_pos.shape[0]
+
+    # --- 统一 obs_radii 形状 ---
+    if obs_radii.ndim == 2 and obs_radii.shape[1] == 1:
+        obs_radii = obs_radii.squeeze(1)  # [M]
+
+    # --- 计算到每个圆障碍边界的净空 d_t = ||p-c|| - r ---
+    R = tracker_pos.unsqueeze(1) - obs_centers.unsqueeze(0)   # [N,M,dim]
+    dist = torch.linalg.norm(R, dim=-1)                       # [N,M]
+    clearance = dist - obs_radii.view(1, -1)                  # [N,M]
+
+    d_t, idx = clearance.min(dim=1)                           # [N], [N]
+    R_min    = R[torch.arange(N, device=device), idx]         # [N,dim]
+    dist_min = dist[torch.arange(N, device=device), idx].clamp_min(eps)  # [N]
+    n_hat    = R_min / dist_min.unsqueeze(-1)                 # [N,dim] 障碍外法向
+
+    # \dot d_t = n_hat · v   （障碍静止）
+    dtdot = (n_hat * tracker_vel).sum(dim=-1)                 # [N]
+    v_c   = torch.clamp(-dtdot, min=0.0)                      # 只惩罚“接近”
+
+    # --- 统一/广播 d_s ---
+    # 接受 float/int/tuple/list/tensor；把它变成与 d_t 可广播的张量
+    if isinstance(d_s, (tuple, list)):
+        # 常见的 (0.6,) 情况
+        if len(d_s) == 1:
+            d_s = d_s[0]
+        else:
+            d_s = torch.as_tensor(d_s, device=device, dtype=dtype)
+    if not torch.is_tensor(d_s):
+        d_s = torch.tensor(d_s, device=device, dtype=dtype)
+
+    # 若 d_s 是标量，自动扩展到 [N]
+    if d_s.ndim == 0:
+        d_s = d_s.expand_as(d_t)           # [N]
+    elif d_s.ndim == 1:
+        # 允许 [N]；若是 [1] 也能广播
+        assert d_s.shape[0] in (1, N), f"d_s shape {d_s.shape} must be [N] or [1] or scalar."
+
+    # --- 缓冲项 + softplus 屏障 ---
+    # 缓冲项：v_c * [max(1 - (d_t - d_s), 0)]^2
+    buf = v_c * torch.relu(1.0 - (d_t - d_s))**2
+
+    # 屏障：beta1 * softplus(beta2 * (d_s - d_t))
+    barrier = beta1 * F.softplus(beta2 * (d_s - d_t), beta=1.0)
+
+    rc = buf + barrier
+    return {"rc": rc, "d_t": d_t, "dtdot": dtdot, "idx": idx}
