@@ -1,6 +1,5 @@
 import sys
 from typing import TYPE_CHECKING
-from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
@@ -212,8 +211,8 @@ class Collider:
                     continue
 
                 # pair of fixed links wrt the world
-                # if links_is_fixed[i_la] and links_is_fixed[i_lb]:
-                #     continue
+                if links_is_fixed[i_la] and links_is_fixed[i_lb]:
+                    continue
 
                 collision_pair_validity[i_ga, i_gb] = 1
                 n_possible_pairs += 1

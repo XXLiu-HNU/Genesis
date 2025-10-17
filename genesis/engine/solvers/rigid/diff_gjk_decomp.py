@@ -342,8 +342,8 @@ def func_gjk_contact(
             break
 
     gjk_state.n_contacts[i_b] = n_contacts
-    gjk_state.is_col[i_b] = 1 if n_contacts > 0 else 0
-    gjk_state.multi_contact_flag[i_b] = 1
+    gjk_state.is_col[i_b] = n_contacts > 0
+    gjk_state.multi_contact_flag[i_b] = True
 
 
 @ti.func
@@ -652,7 +652,7 @@ def func_add_diff_contact_input(
     gjk_state.diff_contact_input.local_pos2_c[i_b, n] = gjk_state.polytope_verts.local_obj2[i_b, i_v3]
     gjk_state.diff_contact_input.w_local_pos1[i_b, n] = localpos1
     gjk_state.diff_contact_input.w_local_pos2[i_b, n] = localpos2
-    gjk_state.diff_contact_input.valid[i_b, n] = ~(is_face_degenerate or is_origin_close_to_face)
+    gjk_state.diff_contact_input.valid[i_b, n] = not (is_face_degenerate or is_origin_close_to_face)
     gjk_state.n_diff_contact_input[i_b] += 1
 
 
