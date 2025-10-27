@@ -16,6 +16,7 @@ from genesis.utils.geom import (
 from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles, obstacle_features, collision_reward
 
 from depth_visibility_2d import visibility_and_tto_2d, Params2D
+from image_processor import ImageProcessor
 
 from path_search import (
     sample_free_xy, PathFollower, sample_free_xy_batch, sample_around_centers_batch
@@ -24,7 +25,7 @@ from roadmap import Roadmap,_line_of_sight_free
 
 import numpy as np
 
-from genesis.sensors.raycaster.patterns import DepthCameraPattern
+# from genesis.sensors.raycaster.patterns import DepthCameraPattern
 
 class TrackerEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False):
@@ -133,15 +134,15 @@ class TrackerEnv:
         self.tracker = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/tracker_drone_urdf/drone.urdf"))
 
         # # ! Add Tracker Sensor
-        # sensor_kwargs = dict(
-        #     entity_idx=self.tracker.idx,
-        #     pos_offset=(0.0, 0.0, 0.0),
-        #     euler_offset=(0.0, 0.0, 0.0),
-        #     return_world_frame=True,
-        #     draw_debug=True,
-        # )
-        # res = ( self.width, self.height)
-        # self.tracker_sensor = self.scene.add_sensor(gs.sensors.DepthCamera(pattern=DepthCameraPattern(res=res), **sensor_kwargs))
+        sensor_kwargs = dict(
+            entity_idx=self.tracker.idx,
+            pos_offset=(0.2, 0.0, 0.1),
+            euler_offset=(0.0, 0.0, 0.0),
+            return_world_frame=True,
+            draw_debug=True,
+        )
+        res = (self.width, self.height)
+        self.tracker_sensor = self.scene.add_sensor(gs.sensors.DepthCamera(pattern=gs.sensors.DepthCameraPattern(res=res), **sensor_kwargs))
 
         # ! Add Traget
         self.target_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
@@ -169,6 +170,11 @@ class TrackerEnv:
         self.obs_xy = torch.tensor(obs_xy, dtype=torch.float32, device=self.device) if len(obs_xy) > 0 else torch.zeros((0,2), dtype=torch.float32, device=self.device)
         self.obs_r  = torch.tensor(obs_r , dtype=torch.float32, device=self.device) if len(obs_r ) > 0 else torch.zeros((0,),  dtype=torch.float32, device=self.device)
         
+
+        self.scene.start_recording(
+            data_func=(lambda: self.tracker_sensor.read_image()[0]) if self.num_envs > 0 else self.tracker_sensor.read_image,
+            rec_options=gs.recorders.MPLImagePlot(),
+        )
         # ! Build scene
         self.scene.build(n_envs=num_envs)
 
@@ -242,7 +248,10 @@ class TrackerEnv:
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
 
-        # self.images = torch.zeros((self.num_envs, self.height, self.width), device=gs.device, dtype=gs.tc_float)
+        self.images = torch.zeros((self.num_envs, self.height, self.width), device=gs.device, dtype=gs.tc_float)
+        # image processor: encoder + augment pipeline
+        # create once and keep on the same device as the simulation
+        self.img_proc = ImageProcessor(device=self.device, max_range=20.0, encoder_out_dim=128, use_mask_channel=True)
 
     def plan_new_mission(self, envs_idx):
         """
@@ -347,7 +356,14 @@ class TrackerEnv:
             actions (torch.Tensor): The actions to be applied to the environment.
         """
 
-        # self.images[:] = self.tracker_sensor.read_image()
+        # read depth images and process (augment + encode)
+        depths = self.tracker_sensor.read_image()  # (N, H, W)
+        depth_feats, depths_aug, mask = self.img_proc.process(depths, training=self.env_cfg.get("train_mode", True))
+        # store augmented depths for visualization/recording
+        self.images[:] = depths_aug
+        # expose image features to extras so policy/training loop can use them
+        self.extras["observations"]["image_feats"] = depth_feats
+
         # ! -------------------------- apply actions --------------------------
         self.actions = actions
         exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
@@ -468,6 +484,7 @@ class TrackerEnv:
             # print(f"{name} reward: {rew.mean().item():.3f}")
 
         # ! -------------------------- compute observations --------------------------
+        # 这里是使用全局障碍物作为障碍物的观测特征，理想化处理
         feats = obstacle_features(
                 tracker_pos_w=self.tracker_pos,
                 tracker_quat=self.tracker_quat,
@@ -487,6 +504,7 @@ class TrackerEnv:
             feats["heading_clear_norm"],
             feats["sector_mins_norm"],   # if K>0
         ], dim=-1)                       # (N, 4+3+4+1+1+K)
+
         self.obs_buf = torch.cat(
             [
                 torch.clip(self.rel_pos * self.obs_scales["max_diff"], -1, 1),          # relative position
@@ -496,6 +514,7 @@ class TrackerEnv:
                 torch.clip(self.target_lin_vel * self.obs_scales["max_lin"], -1, 1),    # target linear velocity
                 torch.clip(self.last_actions * self.obs_scales["max_lin"], -1, 1),      # last action
                 obs_env,                                                                # obstacle features 
+                depth_feats,                                                            # depth image features
             ],
             axis=-1,
         )

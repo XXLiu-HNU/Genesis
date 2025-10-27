@@ -54,6 +54,8 @@ def main():
     # set the max FPS for visualization
     env_cfg["max_visualize_FPS"] = 60
 
+    env_cfg["train_mode"] = False
+
     env = TrackerEnv(
         num_envs=1,
         env_cfg=env_cfg,

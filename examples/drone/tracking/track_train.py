@@ -89,10 +89,12 @@ def get_cfgs():
         "visualize_target": False,
         "visualize_camera": False,
         "max_visualize_FPS": 60,
+        "train_mode": True,
     }
 
     obs_cfg = {
-        "num_obs": 33,
+        # "num_obs": 33,
+        "num_obs":  161, # 128 image feats + 33 other obs
         "obs_scales": {
             "max_diff": 1 / 5.0,
             "max_lin": 1 / 3.0,
