@@ -548,10 +548,19 @@ class TrackerEnv:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
-        for eid in envs_idx:
-            if int(eid) not in self.replan_inqueue:
-                self.replan_queue.append(int(eid))
-                self.replan_inqueue.add(int(eid))
+        # Batch initialize followers to hold current position until planning completes
+        hold_pos_xy = self.target_pos[envs_idx, :2].cpu().numpy()
+        for i, eid in enumerate(envs_idx):
+            eid_int = int(eid)
+            hold_pos = (float(hold_pos_xy[i, 0]), float(hold_pos_xy[i, 1]))
+            self.goal_xy[eid_int] = hold_pos
+            self.path_wps[eid_int] = [hold_pos, hold_pos]
+            self.batched_follower.reset_with_path(eid_int, [hold_pos, hold_pos])
+            self.follower_active[eid_int] = True
+            
+            if eid_int not in self.replan_inqueue:
+                self.replan_queue.append(eid_int)
+                self.replan_inqueue.add(eid_int)
 
 
     def reset(self):

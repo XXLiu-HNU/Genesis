@@ -578,7 +578,8 @@ class BatchedPathFollower:
         r = torch.clamp((s_clamped - L_lo) / denom, 0.0, 1.0).unsqueeze(1)  # (N,1)
         out = p_lo + r * (p_hi - p_lo)
         
-        # For inactive envs, return first point
+        # CRITICAL: For inactive/uninitialized envs, hold at current target position instead of (0,0)
+        # Return path_xy_buf[:, 0] only for active envs; inactive should stay put
         out = torch.where(self.active_mask.unsqueeze(1), out, self.path_xy_buf[:, 0])
         return out
 
