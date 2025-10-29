@@ -478,3 +478,110 @@ class PathFollower:
 
     def reached_goal(self, thresh: float = 0.12) -> bool:
         return (self.s_total - self.s_ref) <= thresh
+
+
+class BatchedPathFollower:
+    """Batched path follower using GPU tensors to eliminate CPU sync points."""
+    def __init__(
+        self, num_envs: int, device: torch.device,
+        dt: float = 0.01,
+        v_max: float = 0.6, a_max: float = 1.2,
+        warmup_time: float = 2.5, v_init: float = 0.08,
+        lookahead_time: float = 0.5, min_lookahead: float = 0.12,
+        slow_down_k: float = 1.2
+    ):
+        self.dt = dt
+        self.v_max_nominal = v_max
+        self.a_max = a_max
+        self.warmup_time = max(1e-6, warmup_time)
+        self.v_init = max(0.02, v_init)
+        self.lookahead_time = lookahead_time
+        self.min_lookahead = min_lookahead
+        self.slow_down_k = max(0.5, slow_down_k)
+        self.device = device
+        # Per-env state tensors
+        self.s_total = torch.zeros(num_envs, device=device, dtype=torch.float32)
+        self.s_ref = torch.zeros(num_envs, device=device, dtype=torch.float32)
+        self.v = torch.zeros(num_envs, device=device, dtype=torch.float32)
+        self.t = torch.zeros(num_envs, device=device, dtype=torch.float32)
+        self.active_mask = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        # Path points stored as flattened tensors (max_points=50)
+        self.max_points = 50
+        self.path_xy_buf = torch.zeros((num_envs, self.max_points, 2), device=device, dtype=torch.float32)
+        self.L_buf = torch.zeros((num_envs, self.max_points), device=device, dtype=torch.float32)
+        self.n_points = torch.zeros(num_envs, device=device, dtype=torch.long)
+
+    def reset_with_path(self, env_idx: int, path_xy: List[Tuple[float, float]]):
+        if not path_xy or len(path_xy) == 0:
+            path_xy = [(0.0, 0.0)]
+        n = min(len(path_xy), self.max_points)
+        pts = torch.tensor(path_xy[:n], device=self.device, dtype=torch.float32)
+        self.path_xy_buf[env_idx, :n] = pts
+        self.n_points[env_idx] = n
+        # Arc length
+        L = [0.0]
+        for i in range(1, n):
+            d = math.sqrt((pts[i,0]-pts[i-1,0])**2 + (pts[i,1]-pts[i-1,1])**2)
+            L.append(L[-1] + d)
+        self.L_buf[env_idx, :n] = torch.tensor(L, device=self.device, dtype=torch.float32)
+        self.s_total[env_idx] = float(L[-1]) if L else 0.0
+        self.s_ref[env_idx] = 0.0
+        self.v[env_idx] = 0.0
+        self.t[env_idx] = 0.0
+        self.active_mask[env_idx] = (self.s_total[env_idx] > 1e-6)
+
+    def step(self) -> torch.Tensor:
+        """Returns (num_envs,2) tensor of next xy positions."""
+        with torch.no_grad():
+            self.t += self.dt
+            alpha = torch.minimum(self.t / self.warmup_time, torch.ones_like(self.t))
+            vmax_now = self.v_init + alpha * (self.v_max_nominal - self.v_init)
+            s_remain = torch.maximum(self.s_total - self.s_ref, torch.zeros_like(self.s_ref))
+            v_brake = torch.sqrt(torch.maximum(2.0 * self.a_max * s_remain / self.slow_down_k, torch.zeros_like(s_remain)))
+            v_des = torch.minimum(vmax_now, v_brake)
+            dv_max = self.a_max * self.dt
+            dv = torch.maximum(torch.minimum(v_des - self.v, torch.full_like(self.v, dv_max)), torch.full_like(self.v, -dv_max))
+            self.v += dv
+            self.s_ref = torch.minimum(self.s_ref + self.v * self.dt, self.s_total)
+            lookahead = torch.maximum(torch.full_like(self.v, self.min_lookahead), self.v * self.lookahead_time)
+            s_query = torch.minimum(self.s_ref + lookahead, self.s_total)
+            # Interpolate for each env (vectorized along batch)
+            return self._interp_batch(s_query)
+
+    def _interp_batch(self, s_query: torch.Tensor) -> torch.Tensor:
+        """s_query: (num_envs,); returns (num_envs,2). Fully vectorized on GPU."""
+        N = self.path_xy_buf.shape[0]
+        eps = 1e-9
+        # Clamp s_query to [0, s_total] element-wise
+        s_clamped = torch.maximum(torch.zeros_like(s_query), torch.minimum(s_query, self.s_total))  # (N,)
+        
+        # Find segment index: last L[j] where L[j] <= s_clamped
+        # L_buf: (N, max_points); s_clamped: (N,) -> (N,1)
+        mask = self.L_buf <= s_clamped.unsqueeze(1)  # (N, max_points)
+        # Mask out indices beyond n_points
+        valid_mask = torch.arange(self.max_points, device=self.device).unsqueeze(0) < self.n_points.unsqueeze(1)  # (N, max_points)
+        mask = mask & valid_mask
+        
+        # lo: last True index; sum gives count of True, minus 1 for index
+        lo = torch.clamp((mask.sum(dim=1) - 1), min=0).long()  # (N,)
+        hi = torch.clamp(lo + 1, min=0, max=self.max_points - 1).long()
+        
+        # Gather L and points using advanced indexing
+        idx_n = torch.arange(N, device=self.device)
+        L_lo = self.L_buf[idx_n, lo]  # (N,)
+        L_hi = self.L_buf[idx_n, hi]
+        p_lo = self.path_xy_buf[idx_n, lo]  # (N,2)
+        p_hi = self.path_xy_buf[idx_n, hi]
+        
+        # Interpolation ratio
+        denom = torch.clamp(L_hi - L_lo, min=eps)
+        r = torch.clamp((s_clamped - L_lo) / denom, 0.0, 1.0).unsqueeze(1)  # (N,1)
+        out = p_lo + r * (p_hi - p_lo)
+        
+        # For inactive envs, return first point
+        out = torch.where(self.active_mask.unsqueeze(1), out, self.path_xy_buf[:, 0])
+        return out
+
+    def reached_goal(self, thresh: float = 0.12) -> torch.Tensor:
+        """Returns (num_envs,) bool tensor."""
+        return (self.s_total - self.s_ref) <= thresh
