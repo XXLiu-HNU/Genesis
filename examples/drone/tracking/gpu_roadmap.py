@@ -153,8 +153,9 @@ class GPURoadmap:
         tries = 0
         while len(nodes) < n_nodes and tries < sample_max_tries:
             tries += 1
-            cand = torch.empty((1024, 2), device=device).uniform_(torch.tensor([xmin, ymin], device=device),
-                                                                  torch.tensor([xmax, ymax], device=device))
+            cand = torch.empty((1024, 2), device=device, dtype=torch.float32)
+            cand[:, 0].uniform_(xmin, xmax)
+            cand[:, 1].uniform_(ymin, ymax)
             if obs_xy.numel() > 0:
                 # distances to all obstacles
                 d = torch.linalg.norm(cand.unsqueeze(1) - obs_xy.unsqueeze(0), dim=-1)  # (B,M)
