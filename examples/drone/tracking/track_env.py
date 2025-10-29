@@ -500,19 +500,28 @@ class TrackerEnv:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
-        # Batch initialize followers to hold current position until planning completes
-        hold_pos_xy = self.target_pos[envs_idx, :2].cpu().numpy()
-        for i, eid in enumerate(envs_idx):
-            eid_int = int(eid)
-            hold_pos = (float(hold_pos_xy[i, 0]), float(hold_pos_xy[i, 1]))
-            self.goal_xy[eid_int] = hold_pos
-            self.path_wps[eid_int] = [hold_pos, hold_pos]
-            self.batched_follower.reset_with_path(eid_int, [hold_pos, hold_pos])
-            self.follower_active[eid_int] = True
-            
-            if eid_int not in self.replan_inqueue:
-                self.replan_queue.append(eid_int)
-                self.replan_inqueue.add(eid_int)
+        # Initialize waypoint GPU state for reset envs
+        if len(envs_idx) > 0:
+            # Sample random goals around initial position
+            angles = torch.rand(num_resets, device=self.device) * 2 * 3.14159
+            distances = torch.rand(num_resets, device=self.device) * self.waypoint_goal_dist + 2.0
+            self.target_waypoint_goal[envs_idx, 0] = tgt_xy[:, 0] + distances * torch.cos(angles)
+            self.target_waypoint_goal[envs_idx, 1] = tgt_xy[:, 1] + distances * torch.sin(angles)
+            # Clamp to world bounds
+            self.target_waypoint_goal[envs_idx, 0] = torch.clamp(
+                self.target_waypoint_goal[envs_idx, 0], 
+                self.world_xy_min[0] + 1, self.world_xy_max[0] - 1
+            )
+            self.target_waypoint_goal[envs_idx, 1] = torch.clamp(
+                self.target_waypoint_goal[envs_idx, 1],
+                self.world_xy_min[1] + 1, self.world_xy_max[1] - 1
+            )
+            # Initialize position, velocity, and timer (reset warmup)
+            self.target_waypoint_current[envs_idx] = tgt_xy
+            self.target_waypoint_pos[envs_idx] = tgt_xy
+            self.target_waypoint_vel[envs_idx] = 0.0
+            self.waypoint_step_counter[envs_idx] = 0
+            self.waypoint_timer[envs_idx] = 0.0  # Reset timer for warmup
 
 
     def reset(self):
