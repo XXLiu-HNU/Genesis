@@ -103,9 +103,9 @@ def get_cfgs():
     reward_cfg = {
         "reward_scales": {
             "collision": - 1.0,
-            "distance_horizontal": 1.0,
+            "distance_horizontal": 5.0,
             "distance_vertical": 1.0,
-            "smooth": -0.1,
+            "smooth": -10,
             "crash": -20.0,
             "max_speed": -0.5,
             "visibility_dir": 1,

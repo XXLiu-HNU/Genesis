@@ -226,8 +226,8 @@ class TrackerEnv:
         self.waypoint_timer = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)  # Timer for warmup
         
         # Waypoint motion parameters (gentle settings to avoid height oscillation)
-        self.waypoint_v_max = 0.4      # Max speed (m/s) - reduced for stability
-        self.waypoint_a_max = 0.6      # Max acceleration (m/s^2) - reduced for gentle motion  
+        self.waypoint_v_max = 2.0      # Max speed (m/s) - reduced for stability
+        self.waypoint_a_max = 3.0      # Max acceleration (m/s^2) - reduced for gentle motion  
         self.waypoint_warmup_time = 3.0  # Warmup time to reach v_max (seconds) - smooth start
         self.waypoint_v_init = 0.05    # Initial max speed during warmup (m/s) - very gentle start
 
@@ -356,6 +356,25 @@ class TrackerEnv:
         self.extras["time_outs"][time_out_idx] = 1.0
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1,)))
+
+        # ! -------------------------- eval prints (only in eval mode) --------------------------
+        if self.env_cfg.get("eval_mode", False):
+            # Horizontal distance (xy plane)
+            horiz_vec = self.rel_pos[:, :2]
+            horiz_dist = torch.linalg.norm(horiz_vec, dim=-1)
+            # Vertical distance (z)
+            vert_dist = torch.abs(self.rel_pos[:, 2])
+            # Bearing of target in tracker body frame (x-forward, y-left). 0 deg when centered ahead
+            # Transform rel_pos (world) to tracker body frame using inv(quat)
+            rel_pos_body = transform_by_quat(self.rel_pos, inv_tracker_quat)
+            bearing_rad = torch.atan2(rel_pos_body[:, 1], rel_pos_body[:, 0])
+            bearing_deg = bearing_rad * (180.0 / math.pi)
+            # Normalize to [-180, 180]
+            bearing_deg = (bearing_deg + 180.0) % 360.0 - 180.0
+            # Print first env values in eval
+            idx = 0
+            if horiz_dist.numel() > 0:
+                print(f"[EVAL] step={int(self.episode_length_buf[idx].item())} horiz_dist={horiz_dist[idx].item():.3f} m, vert_dist={vert_dist[idx].item():.3f} m, target_bearing_body={bearing_deg[idx].item():.1f} deg")
 
         # ! -------------------------- compute reward --------------------------
         self.rew_buf[:] = 0.0

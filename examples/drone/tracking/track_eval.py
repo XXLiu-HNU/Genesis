@@ -49,6 +49,8 @@ def main():
 
     # visualize the target
     env_cfg["visualize_target"] = True
+    # mark eval mode so env can print key metrics
+    env_cfg["eval_mode"] = True
     # for video recording
     env_cfg["visualize_camera"] = args.record
     # set the max FPS for visualization
