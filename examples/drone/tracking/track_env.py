@@ -177,10 +177,10 @@ class TrackerEnv:
         self.obs_r  = torch.tensor(obs_r , dtype=torch.float32, device=self.device) if len(obs_r ) > 0 else torch.zeros((0,),  dtype=torch.float32, device=self.device)
         
 
-        self.scene.start_recording(
-            data_func=(lambda: self.tracker_sensor.read_image()[0]) if self.num_envs > 0 else self.tracker_sensor.read_image,
-            rec_options=gs.recorders.MPLImagePlot(),
-        )
+        # self.scene.start_recording(
+        #     data_func=(lambda: self.tracker_sensor.read_image()[0]) if self.num_envs > 0 else self.tracker_sensor.read_image,
+        #     rec_options=gs.recorders.MPLImagePlot(),
+        # )
         # ! Build scene
         self.scene.build(n_envs=num_envs)
 
@@ -248,9 +248,9 @@ class TrackerEnv:
         self.extras["observations"] = dict()
 
         self.images = torch.zeros((self.num_envs, self.height, self.width), device=gs.device, dtype=gs.tc_float)
-        # image processor: encoder + augment pipeline
+        # image processor: encoder + (optionally disabled) augment pipeline
         # create once and keep on the same device as the simulation
-        self.img_proc = ImageProcessor(device=self.device, max_range=20.0, encoder_out_dim=128, use_mask_channel=True)
+        self.img_proc = ImageProcessor(device=self.device, max_range=20.0, encoder_out_dim=128, use_mask_channel=True, enable_augment=False)
 
     def _collision_detect(self):
         if self.n_obstacles > 0:
@@ -278,12 +278,12 @@ class TrackerEnv:
             actions (torch.Tensor): The actions to be applied to the environment.
         """
 
-        # read depth images and process (augment + encode)
+        # read depth images and process (no-augmentation)
         depths = self.tracker_sensor.read_image()  # (N, H, W)
-        depth_feats, depths_aug, mask = self.img_proc.process(depths, training=self.env_cfg.get("train_mode", True))
-        # store augmented depths for visualization/recording
+        depth_feats, depths_aug, mask = self.img_proc.process(depths, training=False)
+        # store depths for visualization/recording
         self.images[:] = depths_aug
-        # expose image features to extras so policy/training loop can use them
+        # expose image features to policy
         self.extras["observations"]["image_feats"] = depth_feats
         # ! -------------------------- apply actions --------------------------
         self.actions = actions

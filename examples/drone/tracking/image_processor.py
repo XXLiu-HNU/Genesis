@@ -7,15 +7,22 @@ from typing import Optional, Tuple
 # ---------------------------
 # Utils
 # ---------------------------
+_GAUSS_KERNEL_CACHE: dict[tuple[int, torch.device, torch.dtype, float | None], tuple[torch.Tensor, torch.Tensor]] = {}
+
 def _make_gaussian_kernel(k: int, sigma: Optional[float] = None, device=None, dtype=torch.float32):
     assert k % 2 == 1 and k > 1, "kernel size must be odd and >1"
+    key = (k, device, dtype, sigma)
+    if key in _GAUSS_KERNEL_CACHE:
+        return _GAUSS_KERNEL_CACHE[key]
     if sigma is None:
         # heuristics: similar to OpenCV default
         sigma = 0.3 * ((k - 1) * 0.5 - 1) + 0.8
     ax = torch.arange(k, device=device, dtype=dtype) - (k - 1) / 2.0
     g = torch.exp(-(ax ** 2) / (2 * sigma ** 2))
     g = (g / g.sum()).view(1, 1, -1, 1)
-    return g, g.transpose(2, 3)
+    out = (g, g.transpose(2, 3))
+    _GAUSS_KERNEL_CACHE[key] = out
+    return out
 
 
 def _gaussian_blur_2d(x: torch.Tensor, k: int, sigma: Optional[float] = None) -> torch.Tensor:
@@ -81,11 +88,14 @@ def apply_depth_augmentations(
     """
     if device is None:
         device = depths.device
-    g = torch.Generator(device=device)
+    g = None
     if seed is not None:
+        g = torch.Generator(device=device)
         g.manual_seed(seed)
+    rng_kwargs = {"generator": g} if g is not None else {}
 
-    x = depths.clone().to(device)
+    # Avoid unnecessary clone: downstream ops overwrite into x
+    x = depths.to(device)
 
     # ensure batch dim
     added_batch = False
@@ -102,12 +112,12 @@ def apply_depth_augmentations(
     if training:
         # Global multiplicative (per frame)
         if mult_std and mult_std > 0:
-            eps = torch.normal(0.0, mult_std, size=(N, 1, 1), device=device, generator=g)
+            eps = torch.normal(0.0, mult_std, size=(N, 1, 1), device=device, **rng_kwargs)
             x = x * (1.0 + eps)
 
         # Low-frequency multiplicative field
         if lowfreq_mult_strength and lowfreq_mult_strength > 0:
-            lf = torch.normal(0.0, 1.0, size=(N, 1, H, W), device=device, generator=g)
+            lf = torch.normal(0.0, 1.0, size=(N, 1, H, W), device=device, **rng_kwargs)
             lf = _gaussian_blur_2d(lf, k=9)  # smooth to low frequency
             lf = lf / (lf.abs().amax(dim=(2, 3), keepdim=True) + 1e-6)
             x = x * (1.0 + lowfreq_mult_strength * lf.squeeze(1))
@@ -115,58 +125,93 @@ def apply_depth_augmentations(
         # Additive gaussian noise
         if add_gaussian_std and add_gaussian_std > 0:
             sigma = add_gaussian_std * max_range if relative_sigma else add_gaussian_std
-            noise = torch.normal(0.0, sigma, size=x.shape, device=device, generator=g)
+            noise = torch.normal(0.0, sigma, size=x.shape, device=device, **rng_kwargs)
             x = x + noise
 
         # Pixel holes
         if p_hole and p_hole > 0:
-            hole_mask = torch.rand((N, H, W), device=device, generator=g) < p_hole
+            hole_mask = torch.rand((N, H, W), device=device, **rng_kwargs) < p_hole
             x[hole_mask] = max_range
             mask[hole_mask] = False
 
         # Block/stripe occlusions
         if hole_block_prob and hole_block_prob > 0:
-            probs = torch.rand((N,), device=device, generator=g)
-            for i in range(N):
-                if probs[i] < hole_block_prob:
-                    # choose block or stripe
-                    use_stripe = (torch.rand((), generator=g, device=device) < 0.5)
-                    if use_stripe:
-                        # random horizontal or vertical stripe
-                        axis = stripe_axis or ("row" if torch.rand((), generator=g, device=device) < 0.5 else "col")
-                        if axis == "row":
-                            h = max(1, int(torch.randint(2, max(3, int(H * block_max_frac)), (1,), generator=g).item()))
-                            y0 = torch.randint(0, max(1, H - h + 1), (1,), generator=g).item()
-                            x[i, y0:y0+h, :] = max_range
-                            mask[i, y0:y0+h, :] = False
-                        else:
-                            w = max(1, int(torch.randint(2, max(3, int(W * block_max_frac)), (1,), generator=g).item()))
-                            x0 = torch.randint(0, max(1, W - w + 1), (1,), generator=g).item()
-                            x[i, :, x0:x0+w] = max_range
-                            mask[i, :, x0:x0+w] = False
-                    else:
-                        # rectangular block
-                        fh = max(1, int(torch.randint(2, max(3, int(H * block_max_frac)), (1,), generator=g).item()))
-                        fw = max(1, int(torch.randint(2, max(3, int(W * block_max_frac)), (1,), generator=g).item()))
-                        y0 = torch.randint(0, max(1, H - fh + 1), (1,), generator=g).item()
-                        x0 = torch.randint(0, max(1, W - fw + 1), (1,), generator=g).item()
-                        x[i, y0:y0+fh, x0:x0+fw] = max_range
-                        mask[i, y0:y0+fh, x0:x0+fw] = False
+            probs = torch.rand((N,), device=device, **rng_kwargs)
+            sel = probs < hole_block_prob
+            if sel.any():
+                idx = sel.nonzero(as_tuple=False).squeeze(1)
+                # choose stripe vs block for selected samples
+                use_stripe = torch.rand((idx.numel(),), device=device, **rng_kwargs) < 0.5
+                # stripe axis
+                if stripe_axis is None:
+                    is_row = torch.rand((idx.numel(),), device=device, **rng_kwargs) < 0.5
+                else:
+                    is_row = torch.ones((idx.numel(),), device=device, dtype=torch.bool) if stripe_axis == 'row' else torch.zeros((idx.numel(),), device=device, dtype=torch.bool)
+
+                # prepare random sizes/positions
+                max_h = max(3, int(H * block_max_frac))
+                max_w = max(3, int(W * block_max_frac))
+                rand_h = torch.randint(2, max_h, (idx.numel(),), device=device, **rng_kwargs).clamp(min=1)
+                rand_w = torch.randint(2, max_w, (idx.numel(),), device=device, **rng_kwargs).clamp(min=1)
+                highs_h = torch.clamp(H - rand_h + 1, min=1)
+                highs_w = torch.clamp(W - rand_w + 1, min=1)
+                y0 = (torch.rand((idx.numel(),), device=device, **rng_kwargs) * highs_h.float()).floor().to(torch.long)
+                x0 = (torch.rand((idx.numel(),), device=device, **rng_kwargs) * highs_w.float()).floor().to(torch.long)
+
+                # apply stripes
+                stripe_idx = idx[use_stripe]
+                if stripe_idx.numel() > 0:
+                    row_idx = stripe_idx[is_row[use_stripe]]
+                    col_idx = stripe_idx[~is_row[use_stripe]]
+                    if row_idx.numel() > 0:
+                        h_sel = rand_h[use_stripe][is_row[use_stripe]]
+                        y_sel = y0[use_stripe][is_row[use_stripe]]
+                        for j in range(row_idx.numel()):
+                            h = int(h_sel[j].item())
+                            y = int(y_sel[j].item())
+                            i_ = int(row_idx[j].item())
+                            x[i_, y:y+h, :] = max_range
+                            mask[i_, y:y+h, :] = False
+                    if col_idx.numel() > 0:
+                        w_sel = rand_w[use_stripe][~is_row[use_stripe]]
+                        x_sel = x0[use_stripe][~is_row[use_stripe]]
+                        for j in range(col_idx.numel()):
+                            w = int(w_sel[j].item())
+                            xstart = int(x_sel[j].item())
+                            i_ = int(col_idx[j].item())
+                            x[i_, :, xstart:xstart+w] = max_range
+                            mask[i_, :, xstart:xstart+w] = False
+
+                # apply blocks (non-stripe)
+                block_idx = idx[~use_stripe]
+                if block_idx.numel() > 0:
+                    fh_sel = rand_h[~use_stripe]
+                    fw_sel = rand_w[~use_stripe]
+                    y_sel = y0[~use_stripe]
+                    x_sel = x0[~use_stripe]
+                    for j in range(block_idx.numel()):
+                        fh = int(fh_sel[j].item())
+                        fw = int(fw_sel[j].item())
+                        y = int(y_sel[j].item())
+                        xs = int(x_sel[j].item())
+                        i_ = int(block_idx[j].item())
+                        x[i_, y:y+fh, xs:xs+fw] = max_range
+                        mask[i_, y:y+fh, xs:xs+fw] = False
 
         # Banding noise (sinusoidal along rows or cols)
-        if stripe_prob and torch.rand((), generator=g, device=device) < stripe_prob:
-            axis = stripe_axis or ("row" if torch.rand((), generator=g, device=device) < 0.5 else "col")
+        if stripe_prob and torch.rand((), device=device, **rng_kwargs) < stripe_prob:
+            axis = stripe_axis or ("row" if torch.rand((), device=device, **rng_kwargs) < 0.5 else "col")
             amp = stripe_amp_frac * max_range
             if axis == "row":
                 yy = torch.arange(H, device=device).float().view(1, H, 1)
-                phase = 2 * torch.pi * torch.rand((), generator=g, device=device)
-                freq = torch.rand((), generator=g, device=device) * 0.15 + 0.05
+                phase = 2 * torch.pi * torch.rand((), device=device, **rng_kwargs)
+                freq = torch.rand((), device=device, **rng_kwargs) * 0.15 + 0.05
                 band = amp * torch.sin(freq * yy + phase)
                 x = x + band
             else:
                 xx = torch.arange(W, device=device).float().view(1, 1, W)
-                phase = 2 * torch.pi * torch.rand((), generator=g, device=device)
-                freq = torch.rand((), generator=g, device=device) * 0.15 + 0.05
+                phase = 2 * torch.pi * torch.rand((), device=device, **rng_kwargs)
+                freq = torch.rand((), device=device, **rng_kwargs) * 0.15 + 0.05
                 band = amp * torch.sin(freq * xx + phase)
                 x = x + band
 
@@ -177,7 +222,7 @@ def apply_depth_augmentations(
             x = torch.round((x - min_range) / (max_range - min_range) * levels)
             if quantize_jitter:
                 # add 0..1 LSB uniform noise before de-quantize
-                x = x + torch.rand_like(x, generator=g).clamp(0, 1)
+                x = x + torch.rand_like(x, **rng_kwargs).clamp(0, 1)
                 x = x.clamp(0, levels)
             x = x / levels * (max_range - min_range) + min_range
 
@@ -269,6 +314,7 @@ class ImageProcessor:
         use_soft_mask: bool = True,
         quantize_bits: Optional[int] = None,
         norm_mode: str = "log",  # 'log' | 'linear' | 'inv'
+        enable_augment: bool = False,
     ):
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.max_range = max_range
@@ -276,6 +322,7 @@ class ImageProcessor:
         self.use_soft_mask = use_soft_mask
         self.quantize_bits = quantize_bits
         self.norm_mode = norm_mode
+        self.enable_augment = enable_augment
 
         in_ch = 1 + (1 if use_mask_channel else 0)
         self.encoder = SmallDepthEncoder(in_channels=in_ch, out_dim=encoder_out_dim).to(self.device)
@@ -297,25 +344,47 @@ class ImageProcessor:
             mask: (N,H,W) bool valid hits
         """
         if augment_params is None:
-            augment_params = dict(
-                max_range=self.max_range,
-                add_gaussian_std=0.005,
-                mult_std=0.01,
-                lowfreq_mult_strength=0.02,
-                p_hole=0.002,
-                hole_block_prob=0.10,
-                block_max_frac=0.25,
-                stripe_prob=0.15,
-                stripe_axis=None,
-                stripe_amp_frac=0.02,
-                quantize_bits=self.quantize_bits,
-                quantize_jitter=True,
-                gaussian_blur_kernel=3,
-                relative_sigma=True,
-                dilate_invalid=2,
-                soft_mask=self.use_soft_mask,
-                training=training,
-            )
+            if self.enable_augment and training:
+                augment_params = dict(
+                    max_range=self.max_range,
+                    add_gaussian_std=0.005,
+                    mult_std=0.01,
+                    lowfreq_mult_strength=0.02,
+                    p_hole=0.002,
+                    hole_block_prob=0.10,
+                    block_max_frac=0.25,
+                    stripe_prob=0.15,
+                    stripe_axis=None,
+                    stripe_amp_frac=0.02,
+                    quantize_bits=self.quantize_bits,
+                    quantize_jitter=True,
+                    gaussian_blur_kernel=3,
+                    relative_sigma=True,
+                    dilate_invalid=2,
+                    soft_mask=self.use_soft_mask,
+                    training=True,
+                )
+            else:
+                # No-augmentation (cost-free) path
+                augment_params = dict(
+                    max_range=self.max_range,
+                    add_gaussian_std=0.0,
+                    mult_std=0.0,
+                    lowfreq_mult_strength=0.0,
+                    p_hole=0.0,
+                    hole_block_prob=0.0,
+                    block_max_frac=0.0,
+                    stripe_prob=0.0,
+                    stripe_axis=None,
+                    stripe_amp_frac=0.0,
+                    quantize_bits=None,
+                    quantize_jitter=False,
+                    gaussian_blur_kernel=0,
+                    relative_sigma=True,
+                    dilate_invalid=0,
+                    soft_mask=self.use_soft_mask,
+                    training=False,
+                )
 
         depths = depths.to(self.device)
 
@@ -336,7 +405,10 @@ class ImageProcessor:
         else:
             encoder_input = inp
 
-        feats = self.encoder(encoder_input)
+        # mixed precision forward
+        use_amp = (self.device.type == 'cuda')
+        with torch.cuda.amp.autocast(enabled=use_amp), torch.no_grad():
+            feats = self.encoder(encoder_input)
         return feats, depths_aug, mask_hard
 
 
