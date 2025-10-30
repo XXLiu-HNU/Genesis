@@ -13,17 +13,18 @@ from genesis.utils.geom import (
     inv_quat,
     transform_quat_by_quat,
 )
-from utils import collision_check,occlusion_check,setup_random_cylindrical_obstacles, obstacle_features, collision_reward
+from utils import (
+    collision_check, 
+    occlusion_check, 
+    setup_random_cylindrical_obstacles, 
+    obstacle_features, 
+    collision_reward
+)
 
 from depth_visibility_2d import visibility_and_tto_2d, Params2D
 from image_processor import ImageProcessor
 
-from path_search import (
-    sample_free_xy, PathFollower, sample_free_xy_batch, sample_around_centers_batch
-)
-from roadmap import Roadmap,_line_of_sight_free
-
-import numpy as np
+from path_search import sample_free_xy_batch, sample_around_centers_batch
 
 # from genesis.sensors.raycaster.patterns import DepthCameraPattern
 
@@ -48,6 +49,11 @@ class TrackerEnv:
         
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
+        
+        # Waypoint GPU parameters for target movement
+        self.waypoint_samples = 16          # Number of candidate waypoints to sample per frame
+        self.waypoint_distance = 3.0        # How far to sample waypoints (meters)
+        self.waypoint_goal_dist = 5.0       # Random goal distance range (meters)
 
 
         # ! Add target search parms
@@ -179,39 +185,13 @@ class TrackerEnv:
         self.scene.build(n_envs=num_envs)
 
 
-        # move obstacle to CPU numpy array, because is more efficient to build roadmap on CPU
-        self.obs_xy_cpu_np = self.obs_xy.detach().to("cpu", copy=True).numpy().astype(np.float32)
-        self.obs_r_cpu_np  = self.obs_r.detach().to("cpu", copy=True).numpy().astype(np.float32)
+        # Cache obstacle tensors on device (used for collision detection and waypoint_gpu)
+        self.obs_xy_dev = self.obs_xy.to(self.device, dtype=torch.float32)
+        self.obs_r_dev = self.obs_r.to(self.device, dtype=torch.float32)
+        self.obs_inflated = (self.obs_r_dev + self.inflation_default)
 
-        # =====  Roadmap =====
-
-        # roadmap parameters
-        self.prm_num_nodes   = 1500
-        self.prm_k_neighbors = 12
-        self.prm_max_edge    = 2.5
-        self.prm_clearance   = self.inflation_default
-
-        self.roadmap = Roadmap.build(
-            world_min=(float(self.world_xy_min[0]), float(self.world_xy_min[1])),
-            world_max=(float(self.world_xy_max[0]), float(self.world_xy_max[1])),
-            obs_xy=self.obs_xy_cpu_np,
-            obs_r=self.obs_r_cpu_np,
-            n_nodes=self.prm_num_nodes,
-            k=self.prm_k_neighbors,
-            max_edge_len=self.prm_max_edge,
-            clearance=self.prm_clearance,
-        )
-
-        # ! Add for path searching
-        self.goal_xy = [None] * self.num_envs
-        self.path_wps = [None] * self.num_envs
-        self.followers = [None] * self.num_envs
-
-        from collections import deque
-
-        self.replan_queue = deque()
-        self.replan_inqueue = set()   # remove same env_id in queue
-        self.max_plan_per_step = 32   # max per step
+        print(f"[INFO] Target movement: WAYPOINT_GPU")
+        print(f"       samples={self.waypoint_samples}, distance={self.waypoint_distance}m")
 
 
         # ! Prepare reward functions and multiply reward scales by dt
@@ -244,6 +224,25 @@ class TrackerEnv:
         self.initial_angle = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         self.rel_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        
+        # Waypoint GPU buffers
+        self.target_waypoint_goal = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)
+        self.target_waypoint_current = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)
+        self.target_waypoint_pos = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)  # Actual smooth position
+        self.target_waypoint_vel = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)  # Current velocity
+        self.waypoint_step_counter = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.long)
+        self.waypoint_timer = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)  # Timer for warmup
+        
+        # Waypoint motion parameters (gentle settings to avoid height oscillation)
+        self.waypoint_v_max = 2.0      # Max speed (m/s) - reduced for stability
+        self.waypoint_a_max = 3.0      # Max acceleration (m/s^2) - reduced for gentle motion  
+        self.waypoint_warmup_time = 3.0  # Warmup time to reach v_max (seconds) - smooth start
+        self.waypoint_v_init = 0.05    # Initial max speed during warmup (m/s) - very gentle start
+
+        # Preallocate reusable buffers to avoid per-step allocation
+        self.ref_pos_buf = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
+        self.ref_pos_buf[:, 2] = self.drone_height
+        self.ref_pos_buf[:, 3] = 0.0
 
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
@@ -252,83 +251,6 @@ class TrackerEnv:
         # image processor: encoder + augment pipeline
         # create once and keep on the same device as the simulation
         self.img_proc = ImageProcessor(device=self.device, max_range=20.0, encoder_out_dim=128, use_mask_channel=True)
-
-    def plan_new_mission(self, envs_idx):
-        """
-        for single env in envs_idx, re-plan the target's trajectory
-        """
-        # change envs_idx to Python list
-        if isinstance(envs_idx, torch.Tensor):
-            envs_idx = envs_idx.tolist()
-        elif not isinstance(envs_idx, (list, tuple)):
-            envs_idx = [int(envs_idx)]
-
-        with torch.no_grad():
-
-            for env_id in envs_idx:
-                # current start point (world coordinate)
-                cur = self.target.get_pos()[env_id]
-                start_xy = (cur[0].item(), cur[1].item())
-
-                path_found, chosen_goal, chosen_path = False, None, None
-
-                # increase inflation
-                for attempt in range(self.max_replan_tries):
-                    # sample more goals to increase success rate
-                    goals_xy = []
-                    for _ in range(self.goals_per_try):
-                        g = sample_free_xy(
-                            self.world_xy_min, self.world_xy_max,
-                            self.obs_xy, self.obs_r,
-                            safe_radius=self.prm_clearance,
-                            device=self.device
-                        )
-                        if isinstance(g, torch.Tensor):
-                            g = (float(g[0].item()), float(g[1].item()))
-                        goals_xy.append(g)
-
-                    # once query, if found, break
-                    path_np = self.roadmap.query(start_xy, goals_xy, k_attach=8)
-                    if path_np is not None and path_np.shape[0] >= 2:
-                        chosen_path = [(float(x), float(y)) for (x, y) in path_np.tolist()]
-                        chosen_goal = chosen_path[-1]
-                        path_found = True
-                        break
-
-                if path_found:
-                    # if success, return the goal and path
-                    self.goal_xy[env_id]  = chosen_goal
-                    self.path_wps[env_id] = chosen_path
-
-                    # follower： reset or create new
-                    if self.followers[env_id] is None:
-                        self.followers[env_id] = PathFollower(
-                            chosen_path, self.dt,
-                            v_max=self.v_max, a_max=self.a_max,
-                            warmup_time=self.warmup_time, v_init=self.v_init,
-                            lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
-                            slow_down_k=1.2
-                        )
-                    else:
-                        self.followers[env_id].reset_with_path(chosen_path)
-
-                else:
-                    # if fail, hold position and try next time
-                    print(f"[Planner] WARNING: env {env_id} no path found, holding position.")
-                    hold_xy = start_xy
-                    self.goal_xy[env_id]  = hold_xy
-                    self.path_wps[env_id] = [hold_xy, hold_xy]
-
-                    if self.followers[env_id] is None:
-                        self.followers[env_id] = PathFollower(
-                            self.path_wps[env_id], self.dt,
-                            v_max=self.v_max, a_max=self.a_max,
-                            warmup_time=self.warmup_time, v_init=self.v_init,
-                            lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
-                            slow_down_k=1.2
-                        )
-                    else:
-                        self.followers[env_id].reset_with_path(self.path_wps[env_id])
 
     def _collision_detect(self):
         if self.n_obstacles > 0:
@@ -363,7 +285,6 @@ class TrackerEnv:
         self.images[:] = depths_aug
         # expose image features to extras so policy/training loop can use them
         self.extras["observations"]["image_feats"] = depth_feats
-
         # ! -------------------------- apply actions --------------------------
         self.actions = actions
         exec_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
@@ -372,43 +293,17 @@ class TrackerEnv:
         tracker_prop_rpms = self.tracker.controller.step(exec_actions)       # [N,4] tensor 
         self.tracker.set_propellels_rpm(tracker_prop_rpms)
 
-        cur_pos = self.target.get_pos()   # shape [num_envs, 3]
-        cur_xy = cur_pos[:, :2]           # (N,2)
-
-        ref_pos = torch.zeros((self.num_envs, 4), device=self.device)
-        ref_pos[:, 2] = self.drone_height
-        ref_pos[:, 3] = 0.0
-
-        # 1) collect envs with followers
-        has_follower = [i for i in range(self.num_envs) if self.followers[i] is not None]
-        M = len(has_follower)
-
-        if M > 0:
-            # 2) batch step followers
-            next_list = [self.followers[i].step() for i in has_follower]   # List[(x,y)]
-
-            # 3) only update x,y of ref_pos, keep z and yaw as default
-            next_xy = torch.tensor(next_list, device=self.device, dtype=gs.tc_float)  # (M,2)
-            idx = torch.tensor(has_follower, device=self.device, dtype=torch.long)
-            ref_pos[idx, 0:2] = next_xy
-
-            # 4) batch check reached_goal
-            reached = [i for i in has_follower if self.followers[i].reached_goal(thresh=self.goal_reach_thresh)]
-            for env_id in reached:
-                if env_id not in self.replan_inqueue:
-                    self.replan_queue.append(env_id)
-                    self.replan_inqueue.add(env_id)
-
-        # 5) if not reached goal, hold position
-        no_follower_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
-        if M > 0:
-            no_follower_mask[idx] = False
-        if no_follower_mask.any():
-            ref_pos[no_follower_mask, :3] = cur_pos[no_follower_mask]  # keep position (x,y,z)
-            ref_pos[no_follower_mask, 3]  = 0.0
+        # Target movement control (waypoint_gpu only)
+        self._update_waypoint_gpu()
+        self._move_to_waypoint_smooth()  # Smooth movement with velocity control
+        self.ref_pos_buf[:, 0:2] = self.target_waypoint_pos
+        
+        # Ensure height and yaw are always set correctly (critical for stability)
+        self.ref_pos_buf[:, 2] = self.drone_height
+        self.ref_pos_buf[:, 3] = 0.0
 
 
-        target_prop_rpms = self.target.controller.step(ref_pos)
+        target_prop_rpms = self.target.controller.step(self.ref_pos_buf)
         self.target.set_propellels_rpm(target_prop_rpms)
 
         self.scene.step()
@@ -475,13 +370,31 @@ class TrackerEnv:
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1,)))
 
+        # ! -------------------------- eval prints (only in eval mode) --------------------------
+        if self.env_cfg.get("eval_mode", False):
+            # Horizontal distance (xy plane)
+            horiz_vec = self.rel_pos[:, :2]
+            horiz_dist = torch.linalg.norm(horiz_vec, dim=-1)
+            # Vertical distance (z)
+            vert_dist = torch.abs(self.rel_pos[:, 2])
+            # Bearing of target in tracker body frame (x-forward, y-left). 0 deg when centered ahead
+            # Transform rel_pos (world) to tracker body frame using inv(quat)
+            rel_pos_body = transform_by_quat(self.rel_pos, inv_tracker_quat)
+            bearing_rad = torch.atan2(rel_pos_body[:, 1], rel_pos_body[:, 0])
+            bearing_deg = bearing_rad * (180.0 / math.pi)
+            # Normalize to [-180, 180]
+            bearing_deg = (bearing_deg + 180.0) % 360.0 - 180.0
+            # Print first env values in eval
+            idx = 0
+            if horiz_dist.numel() > 0:
+                print(f"[EVAL] step={int(self.episode_length_buf[idx].item())} horiz_dist={horiz_dist[idx].item():.3f} m, vert_dist={vert_dist[idx].item():.3f} m, target_bearing_body={bearing_deg[idx].item():.1f} deg")
+
         # ! -------------------------- compute reward --------------------------
         self.rew_buf[:] = 0.0
         for name, reward_func in self.reward_functions.items():
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
-            # print(f"{name} reward: {rew.mean().item():.3f}")
 
         # ! -------------------------- compute observations --------------------------
         # 这里是使用全局障碍物作为障碍物的观测特征，理想化处理
@@ -522,7 +435,6 @@ class TrackerEnv:
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
 
-        self._drain_replan_queue()
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
@@ -551,13 +463,13 @@ class TrackerEnv:
         inflation = self.inflation_default
 
         # ! -------------------------- reset target --------------------------
-        # sample new target position
+        # Sample new target position
         tgt_xy = sample_free_xy_batch(
             self.world_xy_min, self.world_xy_max,
             self.obs_xy, self.obs_r,
             safe_radius=inflation,
             n=num_resets, device=self.device
-        )  # [n,2] # (num_resets,2)
+        )  # (num_resets, 2)
 
         new_target_pos = torch.zeros((num_resets, 3), device=self.device)
         new_target_pos[:, 0] = tgt_xy[:, 0]
@@ -623,10 +535,28 @@ class TrackerEnv:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
-        for eid in envs_idx:
-            if int(eid) not in self.replan_inqueue:
-                self.replan_queue.append(int(eid))
-                self.replan_inqueue.add(int(eid))
+        # Initialize waypoint GPU state for reset envs
+        if len(envs_idx) > 0:
+            # Sample random goals around initial position
+            angles = torch.rand(num_resets, device=self.device) * 2 * 3.14159
+            distances = torch.rand(num_resets, device=self.device) * self.waypoint_goal_dist + 2.0
+            self.target_waypoint_goal[envs_idx, 0] = tgt_xy[:, 0] + distances * torch.cos(angles)
+            self.target_waypoint_goal[envs_idx, 1] = tgt_xy[:, 1] + distances * torch.sin(angles)
+            # Clamp to world bounds
+            self.target_waypoint_goal[envs_idx, 0] = torch.clamp(
+                self.target_waypoint_goal[envs_idx, 0], 
+                self.world_xy_min[0] + 1, self.world_xy_max[0] - 1
+            )
+            self.target_waypoint_goal[envs_idx, 1] = torch.clamp(
+                self.target_waypoint_goal[envs_idx, 1],
+                self.world_xy_min[1] + 1, self.world_xy_max[1] - 1
+            )
+            # Initialize position, velocity, and timer (reset warmup)
+            self.target_waypoint_current[envs_idx] = tgt_xy
+            self.target_waypoint_pos[envs_idx] = tgt_xy
+            self.target_waypoint_vel[envs_idx] = 0.0
+            self.waypoint_step_counter[envs_idx] = 0
+            self.waypoint_timer[envs_idx] = 0.0  # Reset timer for warmup
 
 
     def reset(self):
@@ -634,92 +564,157 @@ class TrackerEnv:
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         return self.obs_buf, None
 
-    def _drain_replan_queue(self, budget=None):
-        """Drains the replan queue and processes planning requests."""
-        if budget is None:
-            budget = self.max_plan_per_step
+    def _move_to_waypoint_smooth(self):
+        """
+        Smooth movement towards current waypoint with velocity and acceleration limits.
+        Includes warmup phase to prevent aggressive initial acceleration.
+        """
+        # Increment timer for warmup
+        self.waypoint_timer += self.dt
+        
+        # Warmup: gradually increase max speed from v_init to v_max
+        # Ensure proper batch dimensions: (num_envs, 1)
+        warmup_factor = torch.clamp(self.waypoint_timer / self.waypoint_warmup_time, 0.0, 1.0).unsqueeze(1)  # (num_envs, 1)
+        current_v_max = self.waypoint_v_init + warmup_factor * (self.waypoint_v_max - self.waypoint_v_init)  # (num_envs, 1)
+        
+        # Direction to current waypoint
+        to_waypoint = self.target_waypoint_current - self.target_waypoint_pos  # (num_envs, 2)
+        dist_to_waypoint = torch.norm(to_waypoint, dim=1, keepdim=True)  # (num_envs, 1)
+        
+        # Desired velocity: towards waypoint, clamped by current max speed (with warmup)
+        # Slow down when close to waypoint
+        slowdown_dist = 1.0  # Start slowing down 1m from waypoint
+        speed_factor = torch.clamp(dist_to_waypoint / slowdown_dist, 0.0, 1.0)  # (num_envs, 1)
+        desired_speed = current_v_max * speed_factor  # (num_envs, 1)
+        
+        # Desired velocity direction
+        direction = torch.where(
+            dist_to_waypoint > 1e-6,
+            to_waypoint / (dist_to_waypoint + 1e-9),
+            torch.zeros_like(to_waypoint)
+        )  # (num_envs, 2)
+        desired_vel = direction * desired_speed  # (num_envs, 2) * (num_envs, 1) = (num_envs, 2)
+        
+        # Apply acceleration limit
+        vel_change = desired_vel - self.target_waypoint_vel
+        vel_change_norm = torch.norm(vel_change, dim=1, keepdim=True)
+        max_vel_change = self.waypoint_a_max * self.dt
+        
+        vel_change = torch.where(
+            vel_change_norm > max_vel_change,
+            vel_change / (vel_change_norm + 1e-9) * max_vel_change,
+            vel_change
+        )
+        
+        # Update velocity and position
+        self.target_waypoint_vel += vel_change
+        self.target_waypoint_pos += self.target_waypoint_vel * self.dt
+        
+        # Clamp to world bounds
+        self.target_waypoint_pos[:, 0] = torch.clamp(
+            self.target_waypoint_pos[:, 0],
+            self.world_xy_min[0], self.world_xy_max[0]
+        )
+        self.target_waypoint_pos[:, 1] = torch.clamp(
+            self.target_waypoint_pos[:, 1],
+            self.world_xy_min[1], self.world_xy_max[1]
+        )
 
-        batch = []
-        while budget > 0 and self.replan_queue:
-            eid = self.replan_queue.popleft()
-            if eid in self.replan_inqueue:
-                self.replan_inqueue.remove(eid)
-            batch.append(eid)
-            budget -= 1
-
-        if batch:
-            # use batch planning
-            self.plan_new_mission_batch(batch, max_plan_per_step=len(batch))
-
-    def plan_new_mission_batch(self, envs_idx, max_plan_per_step=16):
-        if isinstance(envs_idx, torch.Tensor):
-            envs_idx = envs_idx.tolist()
-        elif not isinstance(envs_idx, (list, tuple)):
-            envs_idx = [int(envs_idx)]
-        if len(envs_idx) == 0:
+    def _update_waypoint_gpu(self):
+        """
+        GPU-based waypoint sampling for target movement.
+        Samples candidate points, checks line-of-sight, picks best waypoint.
+        """
+        # Increment step counter
+        self.waypoint_step_counter += 1
+        
+        # Check which envs need new waypoint (only when reached current waypoint)
+        # Not using timer to avoid waypoint changing before reaching it (which causes unstable movement)
+        dist_to_waypoint = torch.norm(self.target_waypoint_pos - self.target_waypoint_current, dim=1)
+        need_update = (dist_to_waypoint < 0.3)  # Only update when close to waypoint
+        
+        if not torch.any(need_update):
+            # No updates needed, continue moving to current waypoint
             return
-
-        envs_idx = envs_idx[:max_plan_per_step]
-
-        # 1) batch get start position
-        cur_pos = self.target.get_pos()   # [N,3]
-        starts_xy = [(float(cur_pos[i,0].item()), float(cur_pos[i,1].item())) for i in envs_idx]
-
-        # 2) batch sample goals
-        goals_xy_shared = []
-        for _ in range(max(8, self.goals_per_try)):
-            g = sample_free_xy(self.world_xy_min, self.world_xy_max,
-                            self.obs_xy, self.obs_r,
-                            safe_radius=self.prm_clearance, device=self.device)
-            if isinstance(g, torch.Tensor):
-                g = (float(g[0].item()), float(g[1].item()))
-            goals_xy_shared.append(g)
-
-        # 3) batch query path for each start position
-        for idx, env_id in enumerate(envs_idx):
-            start_xy = starts_xy[idx]
-            chosen_path = None
-            # Try line of sight first
-            los_hits = [g for g in goals_xy_shared
-                        if _line_of_sight_free(
-                            np.asarray(start_xy, np.float32),
-                            np.asarray(g, np.float32),
-                            self.roadmap.obs_xy, self.roadmap.obs_r, self.roadmap.clearance)]
-            if len(los_hits) > 0:
-                chosen_path = np.asarray([start_xy, los_hits[0]], dtype=np.float32)
+        
+        # For envs needing update, sample candidate waypoints
+        n_update = need_update.sum().item()
+        update_ids = need_update.nonzero(as_tuple=False).squeeze(-1)  # (n_update,)
+        
+        # Current positions of envs needing update (use smooth position)
+        current_pos = self.target_waypoint_pos[update_ids]  # (n_update, 2)
+        goals = self.target_waypoint_goal[update_ids]  # (n_update, 2)
+        
+        # Sample candidate waypoints: biased towards goal
+        S = self.waypoint_samples
+        candidates = torch.zeros((n_update, S, 2), device=self.device, dtype=torch.float32)
+        
+        for i in range(S):
+            # Mix of random and goal-directed samples
+            if i < S // 2:
+                # Goal-directed: sample along direction to goal
+                t = torch.rand(n_update, device=self.device) * 0.8 + 0.2  # bias towards goal
+                candidates[:, i] = current_pos + t.unsqueeze(1) * (goals - current_pos) * (self.waypoint_distance / (torch.norm(goals - current_pos, dim=1, keepdim=True) + 1e-6))
             else:
-                # PRM query
-                chosen_path = self.roadmap.query(start_xy, goals_xy_shared, k_attach=8)
+                # Random exploration
+                angles = torch.rand(n_update, device=self.device) * 2 * 3.14159
+                distances = torch.rand(n_update, device=self.device) * self.waypoint_distance
+                candidates[:, i, 0] = current_pos[:, 0] + distances * torch.cos(angles)
+                candidates[:, i, 1] = current_pos[:, 1] + distances * torch.sin(angles)
+        
+        # Clamp to world bounds
+        candidates[:, :, 0] = torch.clamp(candidates[:, :, 0], self.world_xy_min[0], self.world_xy_max[0])
+        candidates[:, :, 1] = torch.clamp(candidates[:, :, 1], self.world_xy_min[1], self.world_xy_max[1])
+        
+        # GPU batch line-of-sight check (n_update, S, M)
+        if self.obs_xy.numel() > 0:
+            # Line segment from current_pos to each candidate
+            v = candidates - current_pos.unsqueeze(1)  # (n_update, S, 2)
+            vv = torch.clamp((v * v).sum(-1), min=1e-9)  # (n_update, S)
+            
+            # Vector from current_pos to each obstacle
+            w = self.obs_xy_dev.unsqueeze(0).unsqueeze(0) - current_pos.unsqueeze(1).unsqueeze(1)  # (n_update, S, M, 2)
+            t = ((w * v.unsqueeze(2)).sum(-1) / vv.unsqueeze(-1)).clamp(0.0, 1.0)  # (n_update, S, M)
+            
+            # Closest point on segment to each obstacle
+            proj = current_pos.unsqueeze(1).unsqueeze(1) + t.unsqueeze(-1) * v.unsqueeze(2)  # (n_update, S, M, 2)
+            d = torch.linalg.norm(proj - self.obs_xy_dev.unsqueeze(0).unsqueeze(0), dim=-1)  # (n_update, S, M)
+            
+            # Check collision
+            blocked = d <= (self.obs_r_dev + self.inflation_default).unsqueeze(0).unsqueeze(0)  # (n_update, S, M)
+            is_free = ~blocked.any(dim=2)  # (n_update, S)
+        else:
+            is_free = torch.ones((n_update, S), device=self.device, dtype=torch.bool)
+        
+        # Score waypoints: prefer free, far from current, close to goal
+        dist_to_goal = torch.norm(candidates - goals.unsqueeze(1), dim=2)  # (n_update, S)
+        dist_from_current = torch.norm(candidates - current_pos.unsqueeze(1), dim=2)  # (n_update, S)
+        
+        score = torch.zeros_like(dist_to_goal)
+        score[is_free] = dist_from_current[is_free] * 2.0 - dist_to_goal[is_free] * 0.5  # Prefer far + towards goal
+        score[~is_free] = -1e6  # Penalize blocked
+        
+        # Select best waypoint for each env
+        best_idx = torch.argmax(score, dim=1)  # (n_update,)
+        best_waypoints = candidates[torch.arange(n_update, device=self.device), best_idx]  # (n_update, 2)
+        
+        # Update waypoint targets
+        self.target_waypoint_current[update_ids] = best_waypoints
+        
+        # Check if reached goal, sample new goal
+        dist_to_goal_final = torch.norm(current_pos - goals, dim=1)
+        reached_goal = dist_to_goal_final < 1.0
+        if torch.any(reached_goal):
+            reached_ids = update_ids[reached_goal]
+            n_reached = reached_ids.numel()
+            # Sample new random goals
+            angles = torch.rand(n_reached, device=self.device) * 2 * 3.14159
+            distances = torch.rand(n_reached, device=self.device) * self.waypoint_goal_dist + 2.0
+            new_goals_x = current_pos[reached_goal, 0] + distances * torch.cos(angles)
+            new_goals_y = current_pos[reached_goal, 1] + distances * torch.sin(angles)
+            self.target_waypoint_goal[reached_ids, 0] = torch.clamp(new_goals_x, self.world_xy_min[0] + 1, self.world_xy_max[0] - 1)
+            self.target_waypoint_goal[reached_ids, 1] = torch.clamp(new_goals_y, self.world_xy_min[1] + 1, self.world_xy_max[1] - 1)
 
-            if chosen_path is not None and chosen_path.shape[0] >= 2:
-                path_list = [(float(x), float(y)) for (x, y) in chosen_path.tolist()]
-                self.goal_xy[env_id]  = path_list[-1]
-                self.path_wps[env_id] = path_list
-                if self.followers[env_id] is None:
-                    self.followers[env_id] = PathFollower(
-                        self.path_wps[env_id], self.dt,
-                        v_max=self.v_max, a_max=self.a_max,
-                        warmup_time=self.warmup_time, v_init=self.v_init,
-                        lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
-                        slow_down_k=1.2
-                    )
-                else:
-                    self.followers[env_id].reset_with_path(self.path_wps[env_id])
-            else:
-                # For the worst case, hold position and try next time
-                hold_xy = start_xy
-                self.goal_xy[env_id]  = hold_xy
-                self.path_wps[env_id] = [hold_xy, hold_xy]
-                if self.followers[env_id] is None:
-                    self.followers[env_id] = PathFollower(
-                        self.path_wps[env_id], self.dt,
-                        v_max=self.v_max, a_max=self.a_max,
-                        warmup_time=self.warmup_time, v_init=self.v_init,
-                        lookahead_time=self.lookahead_time, min_lookahead=self.min_lookahead,
-                        slow_down_k=1.2
-                    )
-                else:
-                    self.followers[env_id].reset_with_path(self.path_wps[env_id])
     def _setup_imu_and_controller(self, drone, controller_type, config):
         """
         Sets up the IMU and controller for the drone.
@@ -860,5 +855,4 @@ class TrackerEnv:
         """
         params = Params2D(alpha=8.0, dt=self.dt, H=8, w_v=0.7, w_tto=0.3)
         out = visibility_and_tto_2d(self.obs_xy, self.obs_r, self.target_pos[:,:2], self.target_lin_vel[:,:2], self.tracker_pos[:,:2], self.tracker_lin_vel[:,:2], params)
-        # print(out["V0"], out["TTO"], out["reward"])
         return out["reward"]

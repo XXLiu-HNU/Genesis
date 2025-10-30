@@ -81,16 +81,13 @@ def _line_of_sight_free(a_xy: np.ndarray,
                         obs_xy: np.ndarray,
                         obs_r: np.ndarray,
                         clearance: float) -> bool:
-    """两点之间是否无遮挡（把障碍半径加上 clearance）"""
+    """两点之间是否无遮挡（把障碍半径加上 clearance），使用 numba 加速版本。"""
     if obs_xy.shape[0] == 0:
         return True
+    p0 = a_xy.astype(np.float32)
+    p1 = b_xy.astype(np.float32)
     inflated = (obs_r.astype(np.float32) + float(clearance)).astype(np.float32)
-    return not _segments_intersect_circles(
-        a_xy.astype(np.float32),
-        b_xy.astype(np.float32),
-        obs_xy.astype(np.float32),
-        inflated,
-    )
+    return not _los_hits_any_numba(p0, p1, obs_xy.astype(np.float32), inflated)
 
 # # 在 Roadmap 类里，新增一个更快的 LOS：
 # def _line_of_sight_free(a_xy: np.ndarray,
@@ -224,6 +221,27 @@ class Roadmap:
 
         # 预建一个 KNN 索引，便于 query 时“接入路网”
         # 若没有依赖，我们在 query 里会临时走暴力
+        self._knn_index = None
+        try:
+            if _HAS_SKLEARN:
+                self._knn_index = NearestNeighbors(n_neighbors=min(32, len(self.nodes)))
+                self._knn_index.fit(self.nodes)
+            elif _HAS_SCIPY and len(self.nodes) > 0:
+                self._knn_index = cKDTree(self.nodes)
+        except Exception:
+            self._knn_index = None
+
+    # ---------- pickling (exclude indices; rebuild on load) ----------
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Exclude non-picklable/search index; rebuild after loading
+        if "_knn_index" in state:
+            state["_knn_index"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Rebuild neighbor index if possible
         self._knn_index = None
         try:
             if _HAS_SKLEARN:
