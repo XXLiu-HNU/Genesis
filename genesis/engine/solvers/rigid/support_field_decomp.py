@@ -12,7 +12,6 @@ if TYPE_CHECKING:
     from genesis.engine.solvers.rigid.rigid_solver_decomp import RigidSolver
 
 
-@ti.data_oriented
 class SupportField:
     def __init__(self, rigid_solver: "RigidSolver") -> None:
         self.solver = rigid_solver
@@ -104,6 +103,7 @@ def _kernel_init_support(
     for i in range(n_geoms):
         support_field_info.support_cell_start[i] = support_cell_start[i]
 
+    ti.loop_config(serialize=ti.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i in range(n_support_cells):
         support_field_info.support_vid[i] = support_vid[i]
         for j in ti.static(range(3)):

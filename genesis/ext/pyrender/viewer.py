@@ -9,7 +9,6 @@ import threading
 from threading import Event, RLock, Semaphore, Thread
 from typing import Optional, TYPE_CHECKING
 
-import cv2
 import numpy as np
 import OpenGL
 from OpenGL.GL import *
@@ -1107,6 +1106,9 @@ class Viewer(pyglet.window.Window):
         return filename
 
     def _save_image(self):
+        # Postpone import of OpenCV at runtime to reduce hard system dependencies
+        import cv2
+
         filename = self._get_save_filename(["png", "jpg", "gif", "all"])
         if filename is not None:
             self.viewer_flags["save_directory"] = os.path.dirname(filename)
@@ -1311,7 +1313,13 @@ class Viewer(pyglet.window.Window):
                     else:
                         raise RuntimeError(f"Unable to initialize an OpenGL 3+ context.") from e
 
-        pyglet.clock.schedule_interval(Viewer._time_event, 1.0 / self.viewer_flags["refresh_rate"], self)
+        if self._run_in_thread:
+            pyglet.clock.schedule_interval(Viewer._time_event, 1.0 / self.viewer_flags["refresh_rate"], self)
+        else:
+            # Run as fast as possible if not running in thread
+            pyglet.clock.schedule(Viewer._time_event, self)
+
+        # Update window title
         self.switch_to()
         self.set_caption(self.viewer_flags["window_title"])
 
@@ -1367,10 +1375,11 @@ class Viewer(pyglet.window.Window):
         if viewer_thread != threading.current_thread():
             raise RuntimeError("'Viewer.refresh' can only be called from the thread that started the viewer.")
 
-        time_next_frame = time.time() + 1.0 / self.viewer_flags["refresh_rate"]
-        while self._offscreen_event.wait(time_next_frame - time.time()):
-            self._event_loop_step_offscreen()
-            self._offscreen_event.clear()
+        if self._run_in_thread:
+            time_next_frame = time.time() + 1.0 / self.viewer_flags["refresh_rate"]
+            while self._offscreen_event.wait(time_next_frame - time.time()):
+                self._event_loop_step_offscreen()
+                self._offscreen_event.clear()
 
         pyglet.clock.tick()
 

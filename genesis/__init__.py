@@ -118,8 +118,7 @@ def init(
 
     # Configure GsTaichi fast cache and array type
     global use_ndarray, use_fastcache
-    # is_ndarray_disabled = (os.environ.get("GS_ENABLE_NDARRAY") or ("0" if sys.platform == "darwin" else "1")) == "0"
-    is_ndarray_disabled = os.environ.get("GS_ENABLE_NDARRAY", "0") == "0"
+    is_ndarray_disabled = (os.environ.get("GS_ENABLE_NDARRAY") or ("0" if sys.platform == "darwin" else "1")) == "0"
     if use_ndarray is None:
         _use_ndarray = not (is_ndarray_disabled or performance_mode)
     else:
@@ -226,12 +225,13 @@ def init(
         )
 
     # init gstaichi
+    ti_debug = debug and (os.environ.get("TI_DEBUG") != "0")
     with redirect_stdout(_ti_outputs):
         ti.init(
             arch=TI_ARCH[platform][backend],
-            # Add a (hidden) mechanism to forceable disable taichi debug mode as it is still a bit experimental
-            debug=debug and backend == gs.cpu and (os.environ.get("TI_DEBUG") != "0"),
-            check_out_of_bound=debug,
+            # Add a (hidden) mechanism to forcible disable taichi debug mode as it is still a bit experimental
+            debug=ti_debug and backend == gs_backend.cpu,
+            check_out_of_bound=debug and backend != gs_backend.metal,
             # force_scalarize_matrix=True for speeding up kernel compilation
             # Turning off 'force_scalarize_matrix' is causing numerical instabilities ('nan') on MacOS
             force_scalarize_matrix=True,
@@ -244,6 +244,9 @@ def init(
             default_fp=ti_float,
             **taichi_kwargs,
         )
+
+    # Disable debug checks for taichi
+    ti.lang._template_mapper.__builtins__["__debug__"] = ti_debug
 
     # Make sure that gstaichi arch is matching requirement, then set it in global scope
     ti_config = ti.lang.impl.current_cfg()
@@ -383,7 +386,12 @@ from .ext import _trimesh_patch
 from .utils.misc import get_src_dir as _get_src_dir
 
 with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
-    from pygel3d import graph, hmesh
+    try:
+        from pygel3d import graph, hmesh
+    except OSError as e:
+        # Import may fail because of missing system dependencies (libGLU.so.1).
+        # This is not blocking because it is only an issue for hybrig entities.
+        pass
 
     try:
         sys.path.append(os.path.join(_get_src_dir(), "ext/LuisaRender/build/bin"))

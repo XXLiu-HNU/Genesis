@@ -102,6 +102,7 @@ def test_diff_contact(backend):
                     box0_input_pos = box0_init_pos + sign * rand_dx[0, 0] * FD_EPS
                     box1_input_pos = box1_init_pos + sign * rand_dx[1, 0] * FD_EPS
                 else:
+                    # FIXME: The quaternion should be normalized
                     box0_input_quat = box0_init_quat + sign * rand_dx[0, 0] * FD_EPS
                     box1_input_quat = box1_init_quat + sign * rand_dx[1, 0] * FD_EPS
 
@@ -149,6 +150,7 @@ def test_diff_solver(backend, monkeypatch):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
+            requires_grad=True,
         ),
         rigid_options=gs.options.RigidOptions(
             # We use Newton's method because it converges faster than CG, and therefore gives better gradient estimation
@@ -206,12 +208,9 @@ def test_diff_solver(backend, monkeypatch):
         static_rigid_sim_config=rigid_solver._static_rigid_sim_config,
         contact_island_state=constraint_solver.contact_island.contact_island_state,
     )
-    rigid_solver._func_constraint_clear()
     constraint_solver.add_equality_constraints()
     rigid_solver.collider.detection()
-    constraint_solver.add_frictionloss_constraints()
-    constraint_solver.add_collision_constraints()
-    constraint_solver.add_joint_limit_constraints()
+    constraint_solver.add_inequality_constraints()
     constraint_solver.resolve()
 
     # Loss function to compute gradients using finite difference method
@@ -265,7 +264,7 @@ def test_diff_solver(backend, monkeypatch):
     dL_dforce = ti_to_torch(constraint_solver.constraint_state.dL_dforce)
 
     ### Compute directional derivatives along random directions
-    FD_EPS = 1e-4
+    FD_EPS = 1e-3
     TRIALS = 100
 
     for dL_dx, x_type in (
@@ -327,11 +326,9 @@ def test_diff_solver(backend, monkeypatch):
         assert_allclose(dL_error, 0.0, atol=RTOL)
 
 
+@pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_differentiable_push(precision, show_viewer):
-    # FIXME: Wait for fix to be merged in GsTaichi: https://github.com/Genesis-Embodied-AI/gstaichi/pull/225
-    if sys.platform == "darwin" and gs.backend != gs.cpu:
-        pytest.skip(reason="GsTaichi does not support AutoDiff on non-CPU backend on Mac OS for now.")
     if sys.platform == "linux" and gs.backend == gs.cpu and precision == "64":
         pytest.skip(reason="GsTaichi segfault when using AutoDiff on CPU backend on Linux for now.")
 

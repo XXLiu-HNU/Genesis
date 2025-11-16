@@ -32,8 +32,8 @@ class ConstraintSolverIsland:
         self.sparse_solve: bool = True
 
         # 4 constraints per contact and 1 constraints per joint limit (upper and lower, if not inf)
-        self.len_constraints = (
-            5 * self._collider._collider_info.max_contact_pairs[None]
+        self.len_constraints = int(
+            4 * self._collider._collider_info.max_contact_pairs[None]
             + np.logical_not(np.isinf(self._solver.dofs_info.limit.to_numpy()[:, 0])).sum()
         )
         self.len_constraints_ = max(1, self.len_constraints)
@@ -60,8 +60,8 @@ class ConstraintSolverIsland:
 
         self.efc_D = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
         self.efc_force = ti.field(dtype=gs.ti_float, shape=(self.len_constraints_, self._B))
-        self.active = ti.field(dtype=gs.ti_int, shape=(self.len_constraints_, self._B))
-        self.prev_active = ti.field(dtype=gs.ti_int, shape=(self.len_constraints_, self._B))
+        self.active = ti.field(dtype=gs.ti_bool, shape=(self.len_constraints_, self._B))
+        self.prev_active = ti.field(dtype=gs.ti_bool, shape=(self.len_constraints_, self._B))
         self.qfrc_constraint = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
         self.qacc = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
         self.qacc_ws = ti.field(dtype=gs.ti_float, shape=(self._solver.n_dofs_, self._B))
@@ -515,18 +515,6 @@ class ConstraintSolverIsland:
             if ti.static(self.sparse_solve):
                 for i_c in range(self.len_constraints_):
                     self.jac_n_relevant_dofs[i_c, i_b] = 0
-
-    # def resolve(self):
-    #     from genesis.utils.tools import create_timer
-    #     timer = create_timer(name='resolve', level=3, ti_sync=True, skip_first_call=True)
-    #     self._func_init_solver()
-    #     timer.stamp('_func_init_solver')
-    #     self._func_solve()
-    #     timer.stamp('_func_solve')
-    #     self._func_update_qacc()
-    #     timer.stamp('_func_update_qacc')
-    #     self._func_update_contact_force()
-    #     timer.stamp('compute force')
 
     @ti.func
     def _func_update_contact_force(self, i_island: int, i_b: int):
