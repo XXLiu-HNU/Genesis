@@ -146,7 +146,12 @@ def main():
             runs = [d for d in os.listdir(base_log_dir) if os.path.isdir(os.path.join(base_log_dir, d))]
             if not runs:
                 raise RuntimeError(f"No previous runs found in {base_log_dir}")
-            latest_run = sorted(runs)[-1]  # 按名字排序，取最新
+            # 优先选择时间戳格式的目录（YYYYMMDD-HHMMSS），按时间排序
+            timestamp_runs = [d for d in runs if len(d) == 15 and d[8] == '-']
+            if timestamp_runs:
+                latest_run = sorted(timestamp_runs)[-1]  # 按时间戳排序，取最新
+            else:
+                latest_run = sorted(runs)[-1]  # 如果没有时间戳目录，按名字排序
             log_dir = os.path.join(base_log_dir, latest_run)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")

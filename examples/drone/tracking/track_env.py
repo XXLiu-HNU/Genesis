@@ -280,7 +280,7 @@ class TrackerEnv:
 
         # read depth images and process (no-augmentation)
         depths = self.tracker_sensor.read_image()  # (N, H, W)
-        depth_feats, depths_aug, mask = self.img_proc.process(depths, training=False)
+        depth_feats, depths_aug, mask = self.img_proc.process(depths, training=self.env_cfg.get("train_mode", True))
         # store depths for visualization/recording
         self.images[:] = depths_aug
         # expose image features to policy

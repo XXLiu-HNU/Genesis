@@ -407,7 +407,7 @@ class ImageProcessor:
 
         # mixed precision forward
         use_amp = (self.device.type == 'cuda')
-        with torch.cuda.amp.autocast(enabled=use_amp), torch.no_grad():
+        with torch.amp.autocast('cuda', enabled=use_amp), torch.no_grad():
             feats = self.encoder(encoder_input)
         return feats, depths_aug, mask_hard
 
