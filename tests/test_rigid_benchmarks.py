@@ -30,7 +30,6 @@ DURATION_RECORD = 15.0
 
 pytestmark = [
     pytest.mark.benchmarks,
-    pytest.mark.performance_mode(True),
     pytest.mark.taichi_offline_cache(False),
 ]
 
@@ -216,7 +215,7 @@ def get_file_morph_options(**kwargs):
 
 
 @pytest.fixture(scope="session")
-def stream_writers(backend, printer_session):
+def stream_writers(printer_session):
     report_path = Path(REPORT_FILE)
 
     # Delete old unrelated worker-specific reports
@@ -246,8 +245,12 @@ def stream_writers(backend, printer_session):
 def factory_logger(stream_writers):
     class Logger:
         def __init__(self, hparams: dict[str, Any]):
-            self.hparams = hparams
-            self.benchmark_id = "-".join((BENCHMARK_NAME, pprint_oneline(hparams, delimiter="-")))
+            self.hparams = {
+                **hparams,
+                "dtype": "ndarray" if gs.use_ndarray else "field",
+                "backend": str(gs.backend.name),
+            }
+            self.benchmark_id = "-".join((BENCHMARK_NAME, pprint_oneline(self.hparams, delimiter="-")))
 
             self.logger = None
             self.wandb_run = None
@@ -284,7 +287,6 @@ def factory_logger(stream_writers):
                         "machine_uuid": machine_uuid,
                         "hardware": hardware_fringerprint,
                         "platform": platform_fringerprint,
-                        "backend": str(gs.backend.name),
                         "benchmark_id": self.benchmark_id,
                         **self.hparams,
                     },
@@ -314,7 +316,7 @@ def factory_logger(stream_writers):
                 msg = (
                     pprint_oneline(self.hparams, delimiter=" \t| ")
                     + " \t| "
-                    + pprint_oneline(items, delimiter=" \t| ", digits=0)
+                    + pprint_oneline(items, delimiter=" \t| ", digits=1)
                 )
                 for writer in stream_writers:
                     writer(msg)
@@ -328,15 +330,9 @@ def anymal_c(solver, n_envs, gjk):
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
                 dt=STEP_DT,
-                constraint_solver=solver,
-                enable_self_collision=False,
-                use_gjk_collision=gjk,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
             )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
         ),
         show_viewer=False,
         show_FPS=False,
@@ -389,7 +385,7 @@ def anymal_c(solver, n_envs, gjk):
         elif time_elapsed > DURATION_WARMUP:
             time_start = time.time()
             is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
     realtime_factor = runtime_fps * STEP_DT
 
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
@@ -401,15 +397,9 @@ def batched_franka(solver, n_envs, gjk):
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
                 dt=STEP_DT,
-                constraint_solver=solver,
-                enable_self_collision=False,
-                use_gjk_collision=gjk,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
             )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
         ),
         show_viewer=False,
         show_FPS=False,
@@ -422,10 +412,9 @@ def batched_franka(solver, n_envs, gjk):
                 file="xml/franka_emika_panda/panda.xml",
             )
         ),
-        visualize_contact=True,
     )
     time_start = time.time()
-    scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
+    scene.build(n_envs=n_envs)
     compile_time = time.time() - time_start
 
     num_steps = 0
@@ -441,10 +430,80 @@ def batched_franka(solver, n_envs, gjk):
         elif time_elapsed > DURATION_WARMUP:
             time_start = time.time()
             is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
     realtime_factor = runtime_fps * STEP_DT
 
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+
+
+def _duck_in_box(solver, n_envs, gjk, hard):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            **(dict(constraint_solver=solver) if solver is not None else {}),
+            **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+        ),
+        show_viewer=False,
+        show_FPS=False,
+    )
+    tank = scene.add_entity(
+        gs.morphs.Mesh(
+            file="meshes/tank.obj",
+            scale=5.0,
+            pos=(0.0, 0.0, 0.0),
+            euler=(90, 0, 90),
+            fixed=True,
+        ),
+        vis_mode="collision",
+    )
+    if hard:
+        mesh_kwargs = dict(
+            pos=(0.0, 0.0, 0.035),
+        )
+    else:
+        mesh_kwargs = dict(
+            pos=(0.1, 0.1, 0.035),
+            decompose_object_error_threshold=float("inf"),
+        )
+    duck = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file="meshes/duck.obj",
+            scale=0.04,
+            euler=(90, 0, 90),
+            **mesh_kwargs,
+        ),
+    )
+
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    num_steps = 0
+    is_recording = False
+    time_start = time.time()
+    while True:
+        scene.step()
+        time_elapsed = time.time() - time_start
+        if is_recording:
+            num_steps += 1
+            if time_elapsed > DURATION_RECORD:
+                break
+        elif time_elapsed > DURATION_WARMUP:
+            time_start = time.time()
+            is_recording = True
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
+    realtime_factor = runtime_fps * STEP_DT
+
+    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+
+
+@pytest.fixture
+def duck_in_box_easy(solver, n_envs, gjk):
+    return _duck_in_box(solver, n_envs, gjk, hard=False)
+
+
+@pytest.fixture
+def duck_in_box_hard(solver, n_envs, gjk):
+    return _duck_in_box(solver, n_envs, gjk, hard=True)
 
 
 @pytest.fixture
@@ -453,15 +512,9 @@ def random(solver, n_envs, gjk):
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
                 dt=STEP_DT,
-                constraint_solver=solver,
-                enable_self_collision=False,
-                use_gjk_collision=gjk,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
             )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
         ),
         show_viewer=False,
         show_FPS=False,
@@ -475,10 +528,9 @@ def random(solver, n_envs, gjk):
                 pos=(0, 0, 0.8),
             )
         ),
-        visualize_contact=True,
     )
     time_start = time.time()
-    scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
+    scene.build(n_envs=n_envs)
     compile_time = time.time() - time_start
 
     robot.set_dofs_kp(np.full((12,), fill_value=1000.0), np.arange(6, 18))
@@ -501,81 +553,25 @@ def random(solver, n_envs, gjk):
         elif time_elapsed > DURATION_WARMUP:
             time_start = time.time()
             is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
     realtime_factor = runtime_fps * STEP_DT
 
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
 
 
 @pytest.fixture
-def cubes(solver, n_envs, n_cubes, enable_island, gjk):
+def box_pyramid(n_envs, n_cubes, enable_island, gjk):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
                 dt=STEP_DT,
-                constraint_solver=solver,
                 use_contact_island=enable_island,
-                use_gjk_collision=gjk,
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
             )
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
+            camera_pos=(0.0, -3.5, 2.5),
             camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
-        ),
-        show_viewer=False,
-        show_FPS=False,
-    )
-
-    scene.add_entity(gs.morphs.Plane())
-    for i in range(n_cubes):
-        scene.add_entity(
-            gs.morphs.Box(
-                size=(0.1, 0.1, 0.1),
-                pos=(0.0, 0.2 * i, 0.045),
-            ),
-        )
-    time_start = time.time()
-    scene.build(n_envs=n_envs)
-    compile_time = time.time() - time_start
-
-    num_steps = 0
-    is_recording = False
-    time_start = time.time()
-    while True:
-        scene.step()
-        time_elapsed = time.time() - time_start
-        if is_recording:
-            num_steps += 1
-            if time_elapsed > DURATION_RECORD:
-                break
-        elif time_elapsed > DURATION_WARMUP:
-            time_start = time.time()
-            is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
-    realtime_factor = runtime_fps * STEP_DT
-
-    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
-
-
-@pytest.fixture
-def box_pyramid(solver, n_envs, n_cubes, enable_island, gjk, enable_mujoco_compatibility):
-    x_pos = 0.0
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            **get_rigid_solver_options(
-                dt=STEP_DT,
-                constraint_solver=solver,
-                use_contact_island=enable_island,
-                use_gjk_collision=gjk,
-                box_box_detection=False,
-                enable_mujoco_compatibility=enable_mujoco_compatibility,
-            )
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(x_pos, -3.5, 2.5),
-            camera_lookat=(x_pos, 0.0, 0.5),
             camera_fov=30,
             max_FPS=60,
         ),
@@ -583,17 +579,15 @@ def box_pyramid(solver, n_envs, n_cubes, enable_island, gjk, enable_mujoco_compa
         show_FPS=False,
     )
 
-    scene.add_entity(gs.morphs.Plane(pos=(x_pos, 0, 0)))
-    # create pyramid of boxes
+    scene.add_entity(gs.morphs.Plane())
     box_size = 0.25
-    box_spacing = box_size
-    vec_one = np.array([1.0, 1.0, 1.0])
-    box_pos_offset = (x_pos - 0.5, 1, 0.0) + 0.5 * box_size * vec_one
+    box_spacing = (1.0 - 1e-3) * box_size
+    box_pos_offset = (-0.5, 1.0, 0.0) + 0.5 * np.array([box_size, box_size, box_size])
     for i in range(n_cubes):
         for j in range(n_cubes - i):
             scene.add_entity(
                 gs.morphs.Box(
-                    size=box_size * vec_one,
+                    size=[box_size, box_size, box_size],
                     pos=box_pos_offset + box_spacing * np.array([i + 0.5 * j, 0.0, j]),
                 ),
             )
@@ -615,73 +609,59 @@ def box_pyramid(solver, n_envs, n_cubes, enable_island, gjk, enable_mujoco_compa
         elif time_elapsed > DURATION_WARMUP:
             time_start = time.time()
             is_recording = True
-    runtime_fps = num_steps * n_envs / time_elapsed
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
     realtime_factor = runtime_fps * STEP_DT
 
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
 
 
-@pytest.mark.parametrize("runnable", ["anymal_c", "batched_franka", "random"])
-@pytest.mark.parametrize("solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
-@pytest.mark.parametrize("n_envs", [30000])
-@pytest.mark.parametrize("gjk", [False, True])
-def test_speed(factory_logger, request, runnable, solver, n_envs, gjk):
+@pytest.mark.parametrize(
+    "runnable, solver, gjk, n_envs, backend",
+    [
+        ("duck_in_box_easy", None, True, 30000, gs.gpu),
+        ("duck_in_box_easy", None, False, 30000, gs.gpu),
+        ("duck_in_box_hard", None, True, 30000, gs.gpu),
+        ("duck_in_box_hard", None, False, 30000, gs.gpu),
+        ("duck_in_box_hard", None, None, 0, gs.gpu),
+        ("duck_in_box_hard", None, None, 0, gs.cpu),
+        ("anymal_c", None, True, 30000, gs.gpu),
+        ("anymal_c", gs.constraint_solver.CG, None, 30000, gs.gpu),
+        ("anymal_c", gs.constraint_solver.Newton, None, 30000, gs.gpu),
+        ("anymal_c", None, None, 0, gs.gpu),
+        ("anymal_c", None, None, 0, gs.cpu),
+        ("batched_franka", None, True, 30000, gs.gpu),
+        ("batched_franka", gs.constraint_solver.CG, None, 30000, gs.gpu),
+        ("batched_franka", gs.constraint_solver.Newton, None, 30000, gs.gpu),
+        ("batched_franka", None, None, 0, gs.gpu),
+        ("batched_franka", None, None, 0, gs.cpu),
+        ("random", None, None, 30000, gs.gpu),
+    ],
+)
+def test_speed(factory_logger, request, runnable, solver, gjk, n_envs):
     with factory_logger(
         {
             "env": runnable,
             "batch_size": n_envs,
-            "constraint_solver": solver,
+            **({"constraint_solver": solver} if solver is not None else {}),
             "use_contact_island": False,
-            "gjk_collision": gjk,
+            **({"gjk_collision": gjk} if gjk is not None else {}),
         }
     ) as logger:
         logger.write(request.getfixturevalue(runnable))
 
 
-@pytest.mark.parametrize("solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
-@pytest.mark.parametrize("n_cubes", [10])
-# Will skipt constraint_solver_decomp_island.py and migrate this file later.
-# Right now, island is kind of outdated, including those equality constraints.
-# @pytest.mark.parametrize("enable_island", [False, True])
-@pytest.mark.parametrize("enable_island", [False])
-@pytest.mark.parametrize("n_envs", [8192])
-@pytest.mark.parametrize("gjk", [False, True])
-def test_cubes(factory_logger, request, n_cubes, solver, enable_island, n_envs, gjk):
-    with factory_logger(
-        {
-            "env": f"cube#{n_cubes}",
-            "batch_size": n_envs,
-            "constraint_solver": solver,
-            "use_contact_island": enable_island,
-            "gjk_collision": gjk,
-        }
-    ) as logger:
-        logger.write(request.getfixturevalue("cubes"))
-
-
-# FIXME:Increasing the batch size triggers CUDA out-of-memory error (Nvidia H100)
-# FIXME:Increasing # cubes triggers CUDA illegal memory access error for all collision methods (Nvidia RTX 5900)
-@pytest.mark.parametrize("solver", [gs.constraint_solver.Newton])
+@pytest.mark.parametrize("backend", [gs.gpu])
 @pytest.mark.parametrize("n_cubes", [5])
 @pytest.mark.parametrize("enable_island", [False])
 @pytest.mark.parametrize("n_envs", [2048])
-@pytest.mark.parametrize(
-    "gjk, enable_mujoco_compatibility",
-    [
-        (False, True),  # MPR
-        (False, False),  # MPR+SDF
-        (True, False),  # GJK
-    ],
-)
-def test_box_pyramid(factory_logger, request, n_cubes, solver, enable_island, n_envs, gjk, enable_mujoco_compatibility):
+@pytest.mark.parametrize("gjk", [False, True])
+def test_box_pyramid(factory_logger, request, n_cubes, enable_island, gjk, n_envs):
     with factory_logger(
         {
             "env": f"box_pyramid#{n_cubes}",
             "batch_size": n_envs,
-            "constraint_solver": solver,
             "use_contact_island": enable_island,
             "gjk_collision": gjk,
-            "enable_mujoco_compatibility": enable_mujoco_compatibility,
         }
     ) as logger:
         logger.write(request.getfixturevalue("box_pyramid"))
