@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "psutil",
-    "gstaichi==4.0.0",
+    "gstaichi==4.2.0",
     "pydantic>=2.11.0",
     "numpy>=1.26.4",
     "trimesh",
@@ -36,7 +36,7 @@ dependencies = [
     # Used for parsing `.glb` mesh files
     "pygltflib==1.16.0",
     # Use by `PBD3DEntity.sample` to tetrahedralize a mesh
-    "tetgen>=0.6.4; platform_machine!='aarch64'",
+    "tetgen>=0.6.4,<0.7.0; platform_machine!='aarch64'",
     # Used for some advanced mesh processing such as `skeletonization`
     "PyGEL3D",
     # Used to convert VTK output to numpy when converting volume to particles for PBS
