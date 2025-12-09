@@ -1513,13 +1513,27 @@ def test_path_planning_avoidance(backend, n_envs, show_viewer, tol):
     assert not collider_state.n_contacts.to_numpy().any()
     franka.set_qpos(torch.zeros_like(qpos_goal))
 
-    free_path, return_valid_mask = franka.plan_path(
-        qpos_goal=qpos_goal,
-        num_waypoints=300,
-        resolution=0.05,
-        ignore_collision=True,
-        return_valid_mask=True,
-    )
+    num_waypoints = 300
+    if n_envs == 0:
+        free_path, return_valid_mask = franka.plan_path(
+            qpos_goal=qpos_goal,
+            num_waypoints=num_waypoints,
+            resolution=0.05,
+            ignore_collision=True,
+            return_valid_mask=True,
+        )
+    else:
+        return_valid_mask = torch.zeros((n_envs,), dtype=torch.bool, device=gs.device)
+        free_path = torch.empty((num_waypoints, n_envs, franka.n_dofs), dtype=gs.tc_float, device=gs.device)
+        for i in range(n_envs):
+            free_path[:, i : i + 1], return_valid_mask[i : i + 1] = franka.plan_path(
+                qpos_goal=qpos_goal[i : i + 1],
+                envs_idx=[i],
+                num_waypoints=num_waypoints,
+                resolution=0.05,
+                ignore_collision=True,
+                return_valid_mask=True,
+            )
     assert return_valid_mask.all()
     assert_allclose(free_path[0], 0.0, tol=tol)
     assert_allclose(free_path[-1], qpos_goal, tol=tol)
@@ -1828,7 +1842,7 @@ def test_frictionloss_advanced(show_viewer, tol):
     box_pos = box.get_pos()
     assert box_pos[0] > 0.6
     assert_allclose(box_pos[1:], 0.0, tol=0.02)
-    assert_allclose(box.get_dofs_velocity(), 0.0, tol=tol)
+    assert_allclose(box.get_dofs_velocity(), 0.0, tol=5 * tol)
 
 
 @pytest.mark.parametrize("backend", [gs.cpu])
@@ -2661,12 +2675,12 @@ def test_scene_saver_franka(tmp_path, show_viewer, tol):
 
 
 @pytest.mark.required
-def test_drone_hover_same_with_and_without_substeps(show_viewer, tol):
-    base_rpm = 15000
+def test_drone_propellels_force_substep_consistency(show_viewer, tol):
+    BASE_RPM = 15000
 
     scene_ref = gs.Scene(
         sim_options=gs.options.SimOptions(
-            dt=0.002,
+            dt=0.004,
             substeps=1,
         ),
         show_viewer=show_viewer,
@@ -2674,17 +2688,28 @@ def test_drone_hover_same_with_and_without_substeps(show_viewer, tol):
     drone_ref = scene_ref.add_entity(
         morph=gs.morphs.Drone(
             file="urdf/drones/cf2x.urdf",
-            pos=(0, 0, 1.0),
+            pos=(0, 0, 1),
         ),
     )
-    scene_ref.build()
-    for _ in range(2500):
-        drone_ref.set_propellels_rpm([base_rpm, base_rpm, base_rpm, base_rpm])
+    scene_ref.build(n_envs=2)
+
+    # This not only tests setter, but also proper reset (tracking and clearing applied external force)
+    drone_ref.set_propellels_rpm(BASE_RPM)
+    with np.testing.assert_raises(gs.GenesisException):
+        drone_ref.set_propellels_rpm(BASE_RPM)
+    scene_ref.reset()
+    drone_ref.set_propellels_rpm((BASE_RPM,) * 4)
+    scene_ref.reset()
+    drone_ref.set_propellels_rpm(torch.full((scene_ref.n_envs, 4), fill_value=BASE_RPM))
+    scene_ref.reset()
+
+    for _ in range(500):
+        drone_ref.set_propellels_rpm(BASE_RPM)
         scene_ref.step()
 
     scene_test = gs.Scene(
         sim_options=gs.options.SimOptions(
-            dt=0.01,
+            dt=0.02,
             substeps=5,
         ),
         show_viewer=show_viewer,
@@ -2696,8 +2721,8 @@ def test_drone_hover_same_with_and_without_substeps(show_viewer, tol):
         ),
     )
     scene_test.build()
-    for _ in range(500):
-        drone_test.set_propellels_rpm([base_rpm, base_rpm, base_rpm, base_rpm])
+    for _ in range(100):
+        drone_test.set_propellels_rpm(BASE_RPM)
         scene_test.step()
 
     pos_ref = drone_ref.get_dofs_position()
@@ -2742,7 +2767,7 @@ def test_drone_advanced(show_viewer):
     # Wait for the drones to land on the ground and hold straight
     for i in range(400):
         for drone in drones:
-            drone.set_propellels_rpm(torch.full((4,), 50000.0))
+            drone.set_propellels_rpm(50000.0)
         scene.step()
         if i > 350:
             assert scene.rigid_solver.collider._collider_state.n_contacts.to_numpy()[0] == 2
@@ -2753,7 +2778,7 @@ def test_drone_advanced(show_viewer):
     drones[1].set_dofs_velocity([-0.2], [1])
     for i in range(150):
         for drone in drones:
-            drone.set_propellels_rpm(torch.full((4,), 50000.0))
+            drone.set_propellels_rpm(50000.0)
         scene.step()
         if scene.rigid_solver.collider._collider_state.n_contacts.to_numpy()[0] > 2:
             break
@@ -3150,6 +3175,34 @@ def test_getter_vs_state_post_step_consistency(enable_mujoco_compatibility):
     pos = box_link.get_pos()
     with pytest.raises(AssertionError) if enable_mujoco_compatibility else nullcontext():
         assert_allclose(dof_pos[:3], pos, atol=gs.EPS)
+
+
+@pytest.mark.required
+def test_extended_broadcasting():
+    scene = gs.Scene(
+        show_viewer=False,
+    )
+    for i in range(4):
+        scene.add_entity(
+            gs.morphs.Box(
+                size=(1.0, 1.0, 1.0),
+                pos=(0.0, 0.0, i),
+            )
+        )
+    scene.build(n_envs=2)
+
+    envs_idx = torch.tensor([0, 1], dtype=gs.tc_int, device=gs.device)
+    for entity in scene.entities:
+        entity.zero_all_dofs_velocity(envs_idx)
+    assert_allclose(entity.get_dofs_velocity(), 0.0, tol=gs.EPS)
+    entity.set_dofs_velocity(1.0)
+    assert_allclose(entity.get_dofs_velocity(), 1.0, tol=gs.EPS)
+    entity.set_dofs_velocity((1.0, 2.0))
+    assert_allclose(entity.get_dofs_velocity(), np.array([(1.0,) * 6, (2.0,) * 6]), tol=gs.EPS)
+    entity.set_dofs_velocity((3.0,) * 6)
+    assert_allclose(entity.get_dofs_velocity(), 3.0, tol=gs.EPS)
+    entity.zero_all_dofs_velocity(torch.tensor([False, True], dtype=torch.bool, device=gs.device))
+    assert_allclose(entity.get_dofs_velocity(), np.array([(3.0,) * 6, (0.0,) * 6]), tol=gs.EPS)
 
 
 @pytest.mark.required

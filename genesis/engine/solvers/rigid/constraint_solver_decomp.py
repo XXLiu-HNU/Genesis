@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING
 
 import numpy as np
-import numpy.typing as npt
 import gstaichi as ti
 import torch
 
@@ -104,7 +103,7 @@ class ConstraintSolver:
         # and not used when hibernation is not enabled.
         self.contact_island = ContactIsland(self._collider)
 
-    def clear(self, envs_idx: npt.NDArray[np.int32] | None = None, cache_only: bool = False):
+    def clear(self, envs_idx=None, cache_only: bool = False):
         self._eq_const_info_cache.clear()
         if cache_only:
             return
@@ -126,10 +125,16 @@ class ConstraintSolver:
             n_constraints_frictionloss = ti_to_torch(self.constraint_state.n_constraints_frictionloss, copy=False)
             qacc_ws = ti_to_torch(self.constraint_state.qacc_ws, copy=False)
             if isinstance(envs_idx, torch.Tensor):
-                n_constraints.scatter_(0, envs_idx, 0)
-                n_constraints_equality.scatter_(0, envs_idx, 0)
-                n_constraints_frictionloss.scatter_(0, envs_idx, 0)
-                qacc_ws.scatter_(1, envs_idx[None].expand((qacc_ws.shape[0], -1)), 0.0)
+                if envs_idx.dtype == torch.bool:
+                    n_constraints.masked_fill_(envs_idx, 0)
+                    n_constraints_equality.masked_fill_(envs_idx, 0)
+                    n_constraints_frictionloss.masked_fill_(envs_idx, 0)
+                    qacc_ws.masked_fill_(envs_idx[None], 0.0)
+                else:
+                    n_constraints.scatter_(0, envs_idx, 0)
+                    n_constraints_equality.scatter_(0, envs_idx, 0)
+                    n_constraints_frictionloss.scatter_(0, envs_idx, 0)
+                    qacc_ws.scatter_(1, envs_idx[None].expand((qacc_ws.shape[0], -1)), 0.0)
             else:
                 n_constraints[envs_idx] = 0
                 n_constraints_equality[envs_idx] = 0
@@ -146,93 +151,87 @@ class ConstraintSolver:
         )
 
     def add_equality_constraints(self):
-        solver = self._solver
         add_equality_constraints(
-            links_info=solver.links_info,
-            links_state=solver.links_state,
-            dofs_state=solver.dofs_state,
-            dofs_info=solver.dofs_info,
-            joints_info=solver.joints_info,
-            equalities_info=solver.equalities_info,
+            links_info=self._solver.links_info,
+            links_state=self._solver.links_state,
+            dofs_state=self._solver.dofs_state,
+            dofs_info=self._solver.dofs_info,
+            joints_info=self._solver.joints_info,
+            equalities_info=self._solver.equalities_info,
             constraint_state=self.constraint_state,
             collider_state=self._collider._collider_state,
-            rigid_global_info=solver._rigid_global_info,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            rigid_global_info=self._solver._rigid_global_info,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
 
     def add_inequality_constraints(self):
-        solver = self._solver
         add_inequality_constraints(
-            links_info=solver.links_info,
-            links_state=solver.links_state,
-            dofs_state=solver.dofs_state,
-            dofs_info=solver.dofs_info,
-            joints_info=solver.joints_info,
+            links_info=self._solver.links_info,
+            links_state=self._solver.links_state,
+            dofs_state=self._solver.dofs_state,
+            dofs_info=self._solver.dofs_info,
+            joints_info=self._solver.joints_info,
             constraint_state=self.constraint_state,
             collider_state=self._collider._collider_state,
-            rigid_global_info=solver._rigid_global_info,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            rigid_global_info=self._solver._rigid_global_info,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
 
     def resolve(self):
-        solver = self._solver
-
         func_init_solver(
-            dofs_state=solver.dofs_state,
-            entities_info=solver.entities_info,
+            dofs_state=self._solver.dofs_state,
+            entities_info=self._solver.entities_info,
             constraint_state=self.constraint_state,
-            rigid_global_info=solver._rigid_global_info,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            rigid_global_info=self._solver._rigid_global_info,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
         func_solve(
-            entities_info=solver.entities_info,
-            dofs_state=solver.dofs_state,
+            entities_info=self._solver.entities_info,
+            dofs_state=self._solver.dofs_state,
             constraint_state=self.constraint_state,
-            rigid_global_info=solver._rigid_global_info,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            rigid_global_info=self._solver._rigid_global_info,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
 
         func_update_qacc(
-            dofs_state=solver.dofs_state,
+            dofs_state=self._solver.dofs_state,
             constraint_state=self.constraint_state,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
-            errno=solver._errno,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
+            errno=self._solver._errno,
         )
 
-        if solver._options.noslip_iterations > 0:
+        if self._solver._options.noslip_iterations > 0:
             self.noslip()
 
         func_update_contact_force(
-            links_state=solver.links_state,
+            links_state=self._solver.links_state,
             collider_state=self._collider._collider_state,
             constraint_state=self.constraint_state,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
 
     def noslip(self):
-        solver = self._solver
-
         constraint_noslip.kernel_build_efc_AR_b(
-            dofs_state=solver.dofs_state,
-            entities_info=solver.entities_info,
-            rigid_global_info=solver._rigid_global_info,
+            dofs_state=self._solver.dofs_state,
+            entities_info=self._solver.entities_info,
+            rigid_global_info=self._solver._rigid_global_info,
             constraint_state=self.constraint_state,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
 
         constraint_noslip.kernel_noslip(
             collider_state=self._collider._collider_state,
             constraint_state=self.constraint_state,
-            rigid_global_info=solver._rigid_global_info,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            rigid_global_info=self._solver._rigid_global_info,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
 
         constraint_noslip.kernel_dual_finish(
-            dofs_state=solver.dofs_state,
-            entities_info=solver.entities_info,
-            rigid_global_info=solver._rigid_global_info,
+            dofs_state=self._solver.dofs_state,
+            entities_info=self._solver.entities_info,
+            rigid_global_info=self._solver._rigid_global_info,
             constraint_state=self.constraint_state,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
+            static_rigid_sim_config=self._solver._static_rigid_sim_config,
         )
 
     def get_equality_constraints(self, as_tensor: bool = True, to_torch: bool = True):

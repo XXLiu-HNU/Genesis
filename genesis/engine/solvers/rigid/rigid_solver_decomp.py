@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING, Literal
 
 import gstaichi as ti
 import numpy as np
-import numpy.typing as npt
 import torch
 
 import genesis as gs
@@ -46,7 +45,9 @@ TIME_CONSTANT_SAFETY_FACTOR = 2.0
 
 
 def _sanitize_sol_params(
-    sol_params: npt.NDArray[np.float64] | torch.Tensor, min_timeconst: float, default_timeconst: float | None = None
+    sol_params,
+    min_timeconst: float,
+    default_timeconst: float | None = None,
 ):
     timeconst, dampratio, dmin, dmax, width, mid, power = sol_params.reshape((-1, 7)).T
     if default_timeconst is None:
@@ -128,8 +129,6 @@ class RigidSolver(Solver):
             )
 
         self._options = options
-
-        self._cur_step = -1
 
         self.qpos: ti.Template | ti.types.NDArray | None = None
 
@@ -1478,7 +1477,10 @@ class RigidSolver(Solver):
             self.collider.clear(envs_idx)
             if self.constraint_solver is not None:
                 self.constraint_solver.reset(envs_idx)
-            self._cur_step = -1
+
+            for entity in self.entities:
+                if isinstance(entity, DroneEntity):
+                    entity._prev_prop_t = -1
 
     def process_input(self, in_backward=False):
         for entity in self._entities:
@@ -1536,7 +1538,7 @@ class RigidSolver(Solver):
 
     def _sanitize_io_variables(
         self,
-        tensor: np.typing.ArrayLike | None,
+        tensor: "np.typing.ArrayLike | None",
         inputs_idx: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None,
         input_size: int,
         idx_name: str,
@@ -1764,11 +1766,24 @@ class RigidSolver(Solver):
 
     def set_qpos(self, qpos, qs_idx=None, envs_idx=None, *, skip_forward=False):
         if gs.use_zerocopy:
-            mask = (0, *indices_to_mask(qs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, qs_idx)
             data = ti_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False)
-            assign_indexed_tensor(data, mask, qpos)
-            if mask and isinstance(mask[0], torch.Tensor):
-                envs_idx = mask[0].reshape((-1,))
+            qs_mask = indices_to_mask(qs_idx)
+            if (
+                (not qs_mask or isinstance(qs_mask[0], slice))
+                and isinstance(envs_idx, torch.Tensor)
+                and envs_idx.dtype == torch.bool
+            ):
+                qs_data = data[(slice(None), *qs_mask)]
+                if qpos.ndim == 2:
+                    qs_data.masked_scatter_(envs_idx[:, None], qpos)
+                else:
+                    qpos = broadcast_tensor(qpos, gs.tc_float, qs_data.shape)
+                    torch.where(envs_idx[:, None], qpos, qs_data, out=qs_data)
+            else:
+                mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask)
+                assign_indexed_tensor(data, mask, qpos)
+                if mask and isinstance(mask[0], torch.Tensor):
+                    envs_idx = mask[0].reshape((-1,))
         else:
             qpos, qs_idx, envs_idx = self._sanitize_io_variables(
                 qpos, qs_idx, self.n_qs, "qs_idx", envs_idx, skip_allocation=True
@@ -1778,7 +1793,7 @@ class RigidSolver(Solver):
             kernel_set_qpos(qpos, qs_idx, envs_idx, self._rigid_global_info, self._static_rigid_sim_config)
 
         self.collider.reset(envs_idx, cache_only=True)
-        if not isinstance(envs_idx, torch.Tensor):
+        if not isinstance(envs_idx, torch.Tensor) or (not skip_forward and envs_idx.dtype == torch.bool):
             envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         if not skip_forward:
             self.collider.clear(envs_idx)
@@ -1957,18 +1972,34 @@ class RigidSolver(Solver):
     def set_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None, *, skip_forward=False):
         if gs.use_zerocopy:
             vel = ti_to_torch(self.dofs_state.vel, transpose=True, copy=False)
-            if velocity is None and isinstance(dofs_idx, slice) and isinstance(envs_idx, torch.Tensor):
-                (vel := vel[:, dofs_idx]).scatter_(0, envs_idx[:, None].expand((-1, vel.shape[1])), 0.0)
+            dofs_mask = indices_to_mask(dofs_idx)
+            if (
+                (not dofs_mask or isinstance(dofs_mask[0], slice))
+                and isinstance(envs_idx, torch.Tensor)
+                and (velocity is None or (velocity.ndim == 2 and envs_idx.dtype == torch.bool))
+            ):
+                dofs_vel = vel[(slice(None), *dofs_mask)]
+                if velocity is None:
+                    if envs_idx.dtype == torch.bool:
+                        dofs_vel.masked_fill_(envs_idx[:, None], 0.0)
+                    else:
+                        dofs_vel.scatter_(0, envs_idx[:, None].expand((-1, dofs_vel.shape[1])), 0.0)
+                else:
+                    if qpos.ndim == 2:
+                        dofs_vel.masked_scatter_(envs_idx[:, None], velocity)
+                    else:
+                        velocity = broadcast_tensor(velocity, gs.tc_float, dofs_vel.shape)
+                        torch.where(envs_idx[:, None], velocity, dofs_vel, out=dofs_vel)
             else:
-                mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
+                mask = (0, *dofs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *dofs_mask)
                 if velocity is None:
                     vel[mask] = 0.0
                 else:
                     assign_indexed_tensor(vel, mask, velocity)
                 if mask and isinstance(mask[0], torch.Tensor):
                     envs_idx = mask[0].reshape((-1,))
-                elif not isinstance(envs_idx, torch.Tensor):
-                    envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            if not skip_forward and (not isinstance(envs_idx, torch.Tensor) or envs_idx.dtype == torch.bool):
+                envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         else:
             velocity, dofs_idx, envs_idx = self._sanitize_io_variables(
                 velocity, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
@@ -2354,14 +2385,8 @@ class RigidSolver(Solver):
 
     def get_mass_mat(self, dofs_idx=None, envs_idx=None, decompose=False):
         tensor = ti_to_torch(self.mass_mat_L if decompose else self.mass_mat, envs_idx, transpose=True)
-
         if dofs_idx is not None:
-            if isinstance(dofs_idx, (slice, int, np.integer)) or (dofs_idx.ndim == 0):
-                tensor = tensor[:, dofs_idx, dofs_idx]
-                if tensor.ndim == 1:
-                    tensor = tensor.reshape((-1, 1, 1))
-            else:
-                tensor = tensor[:, dofs_idx[:, None], dofs_idx]
+            tensor = tensor[indices_to_mask(None, dofs_idx, dofs_idx)]
         if self.n_envs == 0:
             tensor = tensor[0]
 
@@ -7000,6 +7025,8 @@ def kernel_set_state(
         for j in ti.static(range(3)):
             links_state.pos[i_l, envs_idx[i_b_]][j] = links_pos[envs_idx[i_b_], i_l, j]
             links_state.i_pos_shift[i_l, envs_idx[i_b_]][j] = i_pos_shift[envs_idx[i_b_], i_l, j]
+            links_state.cfrc_applied_vel[i_l, envs_idx[i_b_]][j] = gs.ti_float(0.0)
+            links_state.cfrc_applied_ang[i_l, envs_idx[i_b_]][j] = gs.ti_float(0.0)
         for j in ti.static(range(4)):
             links_state.quat[i_l, envs_idx[i_b_]][j] = links_quat[envs_idx[i_b_], i_l, j]
         links_state.mass_shift[i_l, envs_idx[i_b_]] = mass_shift[envs_idx[i_b_], i_l]
