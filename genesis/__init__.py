@@ -5,6 +5,7 @@ import atexit
 import logging as _logging
 import traceback
 import weakref
+from warnings import warn
 from contextlib import redirect_stdout
 
 # Import gstaichi while collecting its output without printing directly
@@ -21,11 +22,6 @@ except ImportError as e:
     raise ImportError(
         "'torch' module not available. Please install pytorch manually: https://pytorch.org/get-started/locally/"
     ) from e
-if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8):
-    raise ImportError(
-        "'torch<2.8.0' is not supported. Please update pytorch manually: https://pytorch.org/get-started/locally/"
-    )
-
 import numpy as np
 
 from .constants import GS_ARCH, TI_ARCH
@@ -33,6 +29,11 @@ from .constants import backend as gs_backend
 from .logging import Logger
 from .version import __version__
 from .utils import redirect_libc_stderr, set_random_seed, get_platform, get_device
+
+
+_IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
+if _IS_OLD_TORCH:
+    warn("'torch<2.8.0' is not supported. Please update pytorch manually: https://pytorch.org/get-started/locally/")
 
 
 # Global state
@@ -147,7 +148,7 @@ def init(
             _use_zerocopy = True
     else:
         if _use_zerocopy:
-            raise_exception(f"Zero-copy only support by GsTaichi dynamic array mode on CPU and CUDA backend.")
+            raise_exception(f"Zero-copy not supported on {backend} backend.")
         _use_zerocopy = False
     use_zerocopy = _use_zerocopy and (_use_ndarray or backend != gs_backend.metal)
 
@@ -225,11 +226,17 @@ def init(
         torch.backends.cudnn.benchmark = False
         logger.info("Beware running Genesis in debug mode dramatically reduces runtime speed.")
 
-    ti_num_cpu_threads = 1 if debug else os.environ.get("TI_NUM_THREADS")
+    # FIXME: Enforcing Taichi num threads to 1 by default when running on CPU
+    # because it significantly improve performance.
+    ti_num_cpu_threads = os.environ.get("TI_NUM_THREADS")
     if ti_num_cpu_threads is not None:
         taichi_kwargs.update(
             cpu_max_num_threads=int(ti_num_cpu_threads),
             num_compile_threads=int(ti_num_cpu_threads),
+        )
+    else:
+        taichi_kwargs.update(
+            cpu_max_num_threads=1,
         )
 
     if seed is not None:
@@ -298,6 +305,11 @@ def init(
         logger.debug("[GsTaichi] Enabling GsTaichi dynamic array type to avoid scene-specific compilation.")
     if backend == gs_backend.metal:
         logger.debug("[GsTaichi] Beware Apple Metal backend may be unstable.")
+
+    if _IS_OLD_TORCH:
+        logger.warning(
+            "'torch<2.8.0' is not supported. Please update pytorch manually: https://pytorch.org/get-started/locally/"
+        )
 
     msg_options = ", ".join(
         f"{name}: ~~<{val}>~~"
