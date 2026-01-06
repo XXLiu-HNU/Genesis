@@ -33,6 +33,8 @@ class TrackerEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False, show_connection_line=False):
         self.num_envs = num_envs
         self.rendered_env_num = min(10, self.num_envs)
+        self.show_viewer = show_viewer
+        self.show_connection_line = show_connection_line
         self.num_obs = obs_cfg["num_obs"]
         self.num_privileged_obs = None
         self.num_actions = env_cfg["num_actions"]
@@ -458,6 +460,10 @@ class TrackerEnv:
         """
         if len(envs_idx) == 0:
             return
+
+        # ! 在eval模式下打印失败原因
+        if self.show_viewer and len(envs_idx) > 0:
+            self._print_failure_reasons(envs_idx)
 
         num_resets = len(envs_idx)
         inflation = self.inflation_default
@@ -889,3 +895,59 @@ class TrackerEnv:
                 pos = tracker_pos * (1 - t) + target_pos * t
                 # 更新小球位置
                 sphere.set_pos(pos.cpu().numpy())
+    
+    def _print_failure_reasons(self, envs_idx):
+        """
+        在eval模式下打印失败原因
+        
+        Args:
+            envs_idx: 需要重置的环境索引
+        """
+        # 检查是否是首次初始化（这些属性还未创建）
+        if not hasattr(self, 'tracker_euler') or not hasattr(self, 'tracker_pos') or not hasattr(self, 'rel_pos'):
+            return
+        
+        # 检查各种失败条件
+        collision_flag = self._collision_detect()
+        loss_flag = self._loss_detect()
+        pitch_flag = torch.abs(self.tracker_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
+        roll_flag = torch.abs(self.tracker_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        ground_flag = self.tracker_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"]
+        x_flag = torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"]
+        y_flag = torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"]
+        z_flag = torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"]
+        
+        for idx in envs_idx:
+            reasons = []
+            
+            if collision_flag[idx]:
+                reasons.append("碰撞")
+            if loss_flag[idx]:
+                reasons.append("丢失目标")
+            if pitch_flag[idx]:
+                pitch_val = self.tracker_euler[idx, 1].item() * 180 / 3.14159
+                reasons.append(f"俯仰角超限 ({pitch_val:.1f}°)")
+            if roll_flag[idx]:
+                roll_val = self.tracker_euler[idx, 0].item() * 180 / 3.14159
+                reasons.append(f"横滚角超限 ({roll_val:.1f}°)")
+            if ground_flag[idx]:
+                height = self.tracker_pos[idx, 2].item()
+                reasons.append(f"离地过低 (h={height:.2f}m)")
+            if x_flag[idx]:
+                x_val = self.rel_pos[idx, 0].item()
+                reasons.append(f"X距离超限 ({x_val:.2f}m)")
+            if y_flag[idx]:
+                y_val = self.rel_pos[idx, 1].item()
+                reasons.append(f"Y距离超限 ({y_val:.2f}m)")
+            if z_flag[idx]:
+                z_val = self.rel_pos[idx, 2].item()
+                reasons.append(f"Z距离超限 ({z_val:.2f}m)")
+            
+            if not reasons:
+                # 如果没有失败条件，可能是正常完成或超时
+                if self.episode_length_buf[idx] >= self.max_episode_length - 1:
+                    reasons.append("达到最大步数")
+                else:
+                    reasons.append("未知原因")
+            
+            print(f"[重置 Env {idx.item()}] 失败原因: {', '.join(reasons)}")
