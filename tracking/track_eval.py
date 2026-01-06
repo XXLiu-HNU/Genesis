@@ -60,6 +60,7 @@ def main():
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
         show_viewer=True,
+        show_connection_line=True,  # 显示tracker-target连接线
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
@@ -69,7 +70,8 @@ def main():
 
     obs, _ = env.reset()
 
-    max_sim_step = int(env_cfg["episode_length_s"] * env_cfg["max_visualize_FPS"])
+    # max_sim_step = int(env_cfg["episode_length_s"] * env_cfg["max_visualize_FPS"])
+    max_sim_step = int(100 * env_cfg["max_visualize_FPS"]) # 100 seconds to visualize
     with torch.no_grad():
         if args.record:
             env.cam.start_recording()

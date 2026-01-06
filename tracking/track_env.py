@@ -4,8 +4,9 @@ import math
 import copy
 import yaml
 import genesis as gs
-from pid import PIDcontroller
-from odom import Odom
+from controller.pid import PIDcontroller
+from controller.odom import Odom
+
 from genesis.utils.geom import (
     quat_to_xyz,
     xyz_to_quat,
@@ -13,20 +14,23 @@ from genesis.utils.geom import (
     inv_quat,
     transform_quat_by_quat,
 )
+
 from utils import (
     collision_check, 
     occlusion_check, 
     setup_random_cylindrical_obstacles, 
     obstacle_features, 
-    collision_reward
+    collision_reward,
+    sample_free_xy_batch,
+    sample_around_centers_batch,
 )
 from depth_visibility_2d import visibility_and_tto_2d, Params2D
-from path_search import sample_free_xy_batch, sample_around_centers_batch
+from target_planning.parallel_nav_env import VectorizedPathFollower
 
 # from genesis.sensors.raycaster.patterns import DepthCameraPattern
 
 class TrackerEnv:
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False):
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False, show_connection_line=False):
         self.num_envs = num_envs
         self.rendered_env_num = min(10, self.num_envs)
         self.num_obs = obs_cfg["num_obs"]
@@ -43,14 +47,10 @@ class TrackerEnv:
         self.env_cfg = env_cfg
         self.obs_cfg = obs_cfg
         self.reward_cfg = reward_cfg
+        self.show_connection_line = show_connection_line  # 是否显示tracker-target连接线（仅用于可视化）
         
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
-        
-        # Waypoint GPU parameters for target movement
-        self.waypoint_samples = 16          # Number of candidate waypoints to sample per frame
-        self.waypoint_distance = 3.0        # How far to sample waypoints (meters)
-        self.waypoint_goal_dist = 5.0       # Random goal distance range (meters)
 
 
         # ! Add target search parms
@@ -173,17 +173,59 @@ class TrackerEnv:
         self.obs_xy = torch.tensor(obs_xy, dtype=torch.float32, device=self.device) if len(obs_xy) > 0 else torch.zeros((0,2), dtype=torch.float32, device=self.device)
         self.obs_r  = torch.tensor(obs_r , dtype=torch.float32, device=self.device) if len(obs_r ) > 0 else torch.zeros((0,),  dtype=torch.float32, device=self.device)
         
+        # ! 初始化可视化连接线（仅在eval模式下显示）
+        # 必须在 scene.build() 之前添加实体
+        if self.show_connection_line and show_viewer:
+            self.connection_spheres = []
+            self.n_line_spheres = 10  # 每条线用8个小球
+            
+            for env_i in range(min(self.rendered_env_num, num_envs)):
+                spheres_for_env = []
+                for _ in range(self.n_line_spheres):
+                    sphere = self.scene.add_entity(
+                        gs.morphs.Mesh(
+                            file="meshes/sphere.obj",
+                            scale=0.01,  # 小球
+                            pos=(0, 0, 0),
+                            fixed=True,
+                            collision=False,
+                        ),
+                        surface=gs.surfaces.Rough(
+                            diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.3, 0.3)),
+                        ),
+                    )
+                    spheres_for_env.append(sphere)
+                self.connection_spheres.append(spheres_for_env)
+            
+            print(f"[INFO] 可视化连接线已启用 ({len(self.connection_spheres)} 条线，每条{self.n_line_spheres}个点)")
+            self.visualize_connection = True
+        else:
+            self.connection_spheres = None
+            self.visualize_connection = False
+        
         # ! Build scene
         self.scene.build(n_envs=num_envs)
 
-
-        # Cache obstacle tensors on device (used for collision detection and waypoint_gpu)
+        # Cache obstacle tensors on device (used for collision detection)
         self.obs_xy_dev = self.obs_xy.to(self.device, dtype=torch.float32)
         self.obs_r_dev = self.obs_r.to(self.device, dtype=torch.float32)
         self.obs_inflated = (self.obs_r_dev + self.inflation_default)
 
-        print(f"[INFO] Target movement: WAYPOINT_GPU")
-        print(f"       samples={self.waypoint_samples}, distance={self.waypoint_distance}m")
+        # Initialize VectorizedPathFollower for target navigation
+        self.target_follower = VectorizedPathFollower(
+            num_envs=self.num_envs,
+            device=self.device,
+            obs_xy=self.obs_xy,
+            obs_r=self.obs_r,
+            v_max=self.v_max,
+            a_max=self.a_max,
+            goal_reach_thresh=self.goal_reach_thresh,
+            obstacle_avoidance_gain=float(cfg("follower.obstacle_avoidance_gain", 2.0)),
+            safe_distance=float(cfg("follower.safe_distance", 0.5)),
+        )
+
+        print(f"[INFO] Target movement: VectorizedPathFollower (GPU-accelerated with obstacle avoidance)")
+        print(f"       v_max={self.v_max} m/s, a_max={self.a_max} m/s²")
 
 
         # ! Prepare reward functions and multiply reward scales by dt
@@ -217,19 +259,10 @@ class TrackerEnv:
 
         self.rel_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         
-        # Waypoint GPU buffers
-        self.target_waypoint_goal = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)
-        self.target_waypoint_current = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)
-        self.target_waypoint_pos = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)  # Actual smooth position
-        self.target_waypoint_vel = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)  # Current velocity
-        self.waypoint_step_counter = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.long)
-        self.waypoint_timer = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)  # Timer for warmup
-        
-        # Waypoint motion parameters (gentle settings to avoid height oscillation)
-        self.waypoint_v_max = 0.4      # Max speed (m/s) - reduced for stability
-        self.waypoint_a_max = 0.6      # Max acceleration (m/s^2) - reduced for gentle motion  
-        self.waypoint_warmup_time = 3.0  # Warmup time to reach v_max (seconds) - smooth start
-        self.waypoint_v_init = 0.05    # Initial max speed during warmup (m/s) - very gentle start
+        # Target navigation buffers (简化版)
+        self.target_nav_pos_xy = torch.zeros((self.num_envs, 2), device=gs.device, dtype=gs.tc_float)  # 当前目标位置(XY)
+        self.replan_cooldown = 100  # 重规划冷却时间(步)
+        self.last_replan_step = torch.full((self.num_envs,), -10000, dtype=gs.tc_int, device=gs.device)  # 使用gs.tc_int匹配episode_length_buf
 
         # Preallocate reusable buffers to avoid per-step allocation
         self.ref_pos_buf = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
@@ -280,15 +313,13 @@ class TrackerEnv:
         tracker_prop_rpms = self.tracker.controller.step(exec_actions)       # [N,4] tensor 
         self.tracker.set_propellels_rpm(tracker_prop_rpms)
 
-        # Target movement control (waypoint_gpu only)
-        self._update_waypoint_gpu()
-        self._move_to_waypoint_smooth()  # Smooth movement with velocity control
-        self.ref_pos_buf[:, 0:2] = self.target_waypoint_pos
+        # Target navigation control (VectorizedPathFollower)
+        self._update_target_navigation()
+        self.ref_pos_buf[:, 0:2] = self.target_nav_pos_xy
         
         # Ensure height and yaw are always set correctly (critical for stability)
         self.ref_pos_buf[:, 2] = self.drone_height
         self.ref_pos_buf[:, 3] = 0.0
-
 
         target_prop_rpms = self.target.controller.step(self.ref_pos_buf)
         self.target.set_propellels_rpm(target_prop_rpms)
@@ -326,6 +357,10 @@ class TrackerEnv:
         inv_target_quat = inv_quat(self.target_quat)
         self.target_lin_vel[:] = transform_by_quat(self.target.get_vel(), inv_target_quat)
         self.target_ang_vel[:] = transform_by_quat(self.target.get_ang(), inv_target_quat)
+
+        # ! 更新可视化连接线
+        if self.visualize_connection:
+            self._update_connection_lines()
 
         # check termination and reset
         # 1. if drone is in collision
@@ -500,28 +535,20 @@ class TrackerEnv:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
-        # Initialize waypoint GPU state for reset envs
+        # Initialize target navigation state for reset envs
         if len(envs_idx) > 0:
-            # Sample random goals around initial position
-            angles = torch.rand(num_resets, device=self.device) * 2 * 3.14159
-            distances = torch.rand(num_resets, device=self.device) * self.waypoint_goal_dist + 2.0
-            self.target_waypoint_goal[envs_idx, 0] = tgt_xy[:, 0] + distances * torch.cos(angles)
-            self.target_waypoint_goal[envs_idx, 1] = tgt_xy[:, 1] + distances * torch.sin(angles)
-            # Clamp to world bounds
-            self.target_waypoint_goal[envs_idx, 0] = torch.clamp(
-                self.target_waypoint_goal[envs_idx, 0], 
-                self.world_xy_min[0] + 1, self.world_xy_max[0] - 1
-            )
-            self.target_waypoint_goal[envs_idx, 1] = torch.clamp(
-                self.target_waypoint_goal[envs_idx, 1],
-                self.world_xy_min[1] + 1, self.world_xy_max[1] - 1
-            )
-            # Initialize position, velocity, and timer (reset warmup)
-            self.target_waypoint_current[envs_idx] = tgt_xy
-            self.target_waypoint_pos[envs_idx] = tgt_xy
-            self.target_waypoint_vel[envs_idx] = 0.0
-            self.waypoint_step_counter[envs_idx] = 0
-            self.waypoint_timer[envs_idx] = 0.0  # Reset timer for warmup
+            # 采样新的目标点
+            new_goals = self._sample_free_goals_batch(num_resets)
+            
+            # 更新follower的目标
+            self.target_follower.goal_xy[envs_idx] = new_goals
+            self.target_follower.reached[envs_idx] = False
+            
+            # 初始化导航位置为当前目标位置
+            self.target_nav_pos_xy[envs_idx] = tgt_xy
+            
+            # 重置重规划计数器
+            self.last_replan_step[envs_idx] = -10000
 
 
     def reset(self):
@@ -529,63 +556,82 @@ class TrackerEnv:
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         return self.obs_buf, None
 
-    def _move_to_waypoint_smooth(self):
+    def _update_target_navigation(self):
         """
-        Smooth movement towards current waypoint with velocity and acceleration limits.
-        Includes warmup phase to prevent aggressive initial acceleration.
+        使用VectorizedPathFollower更新目标位置（GPU加速，带障碍物避让）
         """
-        # Increment timer for warmup
-        self.waypoint_timer += self.dt
+        # 检查是否需要重规划（到达目标或冷却时间已过）
+        reached = self.target_follower.check_reached()
+        cooldown_passed = (self.episode_length_buf - self.last_replan_step) >= self.replan_cooldown
+        need_replan = reached & cooldown_passed
         
-        # Warmup: gradually increase max speed from v_init to v_max
-        # Ensure proper batch dimensions: (num_envs, 1)
-        warmup_factor = torch.clamp(self.waypoint_timer / self.waypoint_warmup_time, 0.0, 1.0).unsqueeze(1)  # (num_envs, 1)
-        current_v_max = self.waypoint_v_init + warmup_factor * (self.waypoint_v_max - self.waypoint_v_init)  # (num_envs, 1)
+        if need_replan.any():
+            # 为需要重规划的环境采样新目标
+            n_replan = need_replan.sum().item()
+            new_goals = self._sample_free_goals_batch(n_replan)
+            
+            # 更新目标
+            self.target_follower.goal_xy[need_replan] = new_goals
+            self.last_replan_step[need_replan] = self.episode_length_buf[need_replan]
         
-        # Direction to current waypoint
-        to_waypoint = self.target_waypoint_current - self.target_waypoint_pos  # (num_envs, 2)
-        dist_to_waypoint = torch.norm(to_waypoint, dim=1, keepdim=True)  # (num_envs, 1)
+        # 使用follower计算下一个目标位置（包含避障）
+        current_pos_xy = self.target_pos[:, :2]  # [num_envs, 2]
+        target_pos_xy = self.target_follower.step(current_pos_xy, dt=self.dt)
         
-        # Desired velocity: towards waypoint, clamped by current max speed (with warmup)
-        # Slow down when close to waypoint
-        slowdown_dist = 1.0  # Start slowing down 1m from waypoint
-        speed_factor = torch.clamp(dist_to_waypoint / slowdown_dist, 0.0, 1.0)  # (num_envs, 1)
-        desired_speed = current_v_max * speed_factor  # (num_envs, 1)
+        # 更新目标位置buffer
+        self.target_nav_pos_xy = target_pos_xy
+    
+    def _sample_free_goals_batch(self, n: int) -> torch.Tensor:
+        """
+        批量采样不与障碍碰撞的目标位置
+        """
+        goals = torch.empty((n, 2), device=self.device, dtype=torch.float32)
+        sampled = 0
+        max_tries = 100
         
-        # Desired velocity direction
-        direction = torch.where(
-            dist_to_waypoint > 1e-6,
-            to_waypoint / (dist_to_waypoint + 1e-9),
-            torch.zeros_like(to_waypoint)
-        )  # (num_envs, 2)
-        desired_vel = direction * desired_speed  # (num_envs, 2) * (num_envs, 1) = (num_envs, 2)
+        for _ in range(max_tries):
+            if sampled >= n:
+                break
+            
+            remaining = n - sampled
+            batch_size = min(remaining * 5, 1000)
+            
+            # 批量采样
+            candidates = torch.empty((batch_size, 2), device=self.device, dtype=torch.float32)
+            candidates[:, 0] = torch.empty(batch_size, device=self.device).uniform_(
+                self.world_xy_min[0], self.world_xy_max[0]
+            )
+            candidates[:, 1] = torch.empty(batch_size, device=self.device).uniform_(
+                self.world_xy_min[1], self.world_xy_max[1]
+            )
+            
+            # 向量化碰撞检测
+            if self.obs_xy.shape[0] > 0:
+                diff = candidates.unsqueeze(1) - self.obs_xy.unsqueeze(0)
+                dist = torch.norm(diff, dim=-1)
+                min_dist = dist.min(dim=-1).values
+                valid_mask = min_dist >= (self.obs_r.max() + self.inflation_default)
+            else:
+                valid_mask = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+            
+            valid_candidates = candidates[valid_mask]
+            n_valid = min(valid_candidates.shape[0], remaining)
+            
+            if n_valid > 0:
+                goals[sampled:sampled+n_valid] = valid_candidates[:n_valid]
+                sampled += n_valid
         
-        # Apply acceleration limit
-        vel_change = desired_vel - self.target_waypoint_vel
-        vel_change_norm = torch.norm(vel_change, dim=1, keepdim=True)
-        max_vel_change = self.waypoint_a_max * self.dt
+        if sampled < n:
+            # 填充未采样到的（使用世界中心）
+            world_center = torch.tensor([
+                (self.world_xy_min[0] + self.world_xy_max[0]) / 2,
+                (self.world_xy_min[1] + self.world_xy_max[1]) / 2
+            ], device=self.device)
+            goals[sampled:] = world_center
         
-        vel_change = torch.where(
-            vel_change_norm > max_vel_change,
-            vel_change / (vel_change_norm + 1e-9) * max_vel_change,
-            vel_change
-        )
-        
-        # Update velocity and position
-        self.target_waypoint_vel += vel_change
-        self.target_waypoint_pos += self.target_waypoint_vel * self.dt
-        
-        # Clamp to world bounds
-        self.target_waypoint_pos[:, 0] = torch.clamp(
-            self.target_waypoint_pos[:, 0],
-            self.world_xy_min[0], self.world_xy_max[0]
-        )
-        self.target_waypoint_pos[:, 1] = torch.clamp(
-            self.target_waypoint_pos[:, 1],
-            self.world_xy_min[1], self.world_xy_max[1]
-        )
+        return goals
 
-    def _update_waypoint_gpu(self):
+    def _update_waypoint_gpu_deprecated(self):
         """
         GPU-based waypoint sampling for target movement.
         Samples candidate points, checks line-of-sight, picks best waypoint.
@@ -821,3 +867,25 @@ class TrackerEnv:
         params = Params2D(alpha=8.0, dt=self.dt, H=8, w_v=0.7, w_tto=0.3)
         out = visibility_and_tto_2d(self.obs_xy, self.obs_r, self.target_pos[:,:2], self.target_lin_vel[:,:2], self.tracker_pos[:,:2], self.tracker_lin_vel[:,:2], params)
         return out["reward"]
+    
+    def _update_connection_lines(self):
+        """
+        更新tracker和target之间的可视化连接线（仅用于显示，不影响物理）
+        使用一系列小球沿着连线分布
+        """
+        for env_i, spheres in enumerate(self.connection_spheres):
+            if env_i >= self.num_envs:
+                break
+            
+            # 获取tracker和target的位置
+            tracker_pos = self.tracker_pos[env_i]
+            target_pos = self.target_pos[env_i]
+            
+            # 在tracker和target之间插值，更新每个小球的位置
+            for sphere_i, sphere in enumerate(spheres):
+                # 计算插值参数 (0到1之间)
+                t = (sphere_i + 1) / (self.n_line_spheres + 1)
+                # 线性插值位置
+                pos = tracker_pos * (1 - t) + target_pos * t
+                # 更新小球位置
+                sphere.set_pos(pos.cpu().numpy())

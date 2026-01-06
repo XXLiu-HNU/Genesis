@@ -121,7 +121,7 @@ def main():
     parser.add_argument("-e", "--exp_name", type=str, default="drone-hovering")
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=8192)
-    parser.add_argument("--max_iterations", type=int, default=301)
+    parser.add_argument("-i", "--max_iterations", type=int, default=301)
 
     # 新增参数
     parser.add_argument("--resume", action="store_true", default=False, help="resume training from checkpoint")
