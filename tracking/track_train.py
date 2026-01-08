@@ -92,7 +92,8 @@ def get_cfgs():
     }
 
     obs_cfg = {
-        "num_obs": 33,
+        # "num_obs": 33, # observe state
+        "num_obs": 41, # observe state 33 + 32
         "obs_scales": {
             "max_diff": 1 / 5.0,
             "max_lin": 1 / 3.0,

@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn as nn
 import math
 import copy
 import yaml
@@ -29,6 +30,54 @@ from target_planning.parallel_nav_env import VectorizedPathFollower
 
 # from genesis.sensors.raycaster.patterns import DepthCameraPattern
 
+
+class TrajectoryEncoder(nn.Module):
+    """
+    轻量级轨迹编码模块，使用单层GRU编码目标的历史运动轨迹。
+    
+    输入: 
+        - trajectory: (batch_size, sequence_length, input_size)
+          其中 input_size = 3 (相对坐标 x,y,z) + 1 (可见性标签 v)
+    
+    输出:
+        - features: (batch_size, hidden_size) - GRU最后时刻的隐藏状态
+    
+    鲁棒性处理:
+        - 当可见性标签 v=0 时，该帧被视为遮挡，GRU能够通过v标签学习识别
+    """
+    def __init__(self, input_size=4, hidden_size=32, device='cuda'):
+        super(TrajectoryEncoder, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.device = device
+        
+        # 单层GRU，batch_first=True
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            device=device
+        )
+        
+    def forward(self, trajectory):
+        """
+        Args:
+            trajectory: (batch_size, sequence_length, input_size)
+                       包含 [rel_x, rel_y, rel_z, visibility]
+        
+        Returns:
+            features: (batch_size, hidden_size) - 最后时刻的隐藏状态
+        """
+        # GRU forward: output shape (batch_size, seq_len, hidden_size)
+        #              hidden shape (num_layers=1, batch_size, hidden_size)
+        output, hidden = self.gru(trajectory)
+        
+        # 提取最后时刻的隐藏状态: (1, batch_size, hidden_size) -> (batch_size, hidden_size)
+        features = hidden.squeeze(0)
+        
+        return features
+
 class TrackerEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, show_viewer=False, show_connection_line=False):
         self.num_envs = num_envs
@@ -45,6 +94,17 @@ class TrackerEnv:
         self.simulate_action_latency = env_cfg["simulate_action_latency"]
         self.dt = 0.01                                                                  # run in 100hz
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
+        
+        # 轨迹编码器参数
+        self.trajectory_stride = 10  # 每隔5帧采样一次
+        self.trajectory_sequence_length = 10  # GRU输入序列长度
+        self.trajectory_history_length = self.trajectory_stride * self.trajectory_sequence_length  # 50帧，覆盖0.5秒
+        self.trajectory_input_size = 4  # [rel_x, rel_y, rel_z, visibility]
+        self.trajectory_hidden_size = 8  # GRU隐藏层维度
+        
+        # 丢失检测参数
+        self.loss_detection_threshold = 100  # 连续5帧检测不到才算丢失
+        self.consecutive_loss_count = torch.zeros((num_envs,), device=gs.device, dtype=gs.tc_int)
 
         self.env_cfg = env_cfg
         self.obs_cfg = obs_cfg
@@ -275,6 +335,27 @@ class TrackerEnv:
         self.extras["observations"] = dict()
 
         # self.images = torch.zeros((self.num_envs, self.height, self.width), device=gs.device, dtype=gs.tc_float)
+        
+        # ! 初始化轨迹编码器和历史轨迹buffer
+        self.trajectory_encoder = TrajectoryEncoder(
+            input_size=self.trajectory_input_size,
+            hidden_size=self.trajectory_hidden_size,
+            device=self.device
+        ).to(self.device)
+        
+        # 历史轨迹buffer: (num_envs, history_length, input_size)
+        # input_size = 4: [rel_x, rel_y, rel_z, visibility]
+        self.target_trajectory_history = torch.zeros(
+            (self.num_envs, self.trajectory_history_length, self.trajectory_input_size),
+            device=self.device,
+            dtype=gs.tc_float
+        )
+        
+        # 当前可见性标签: (num_envs,) 用于记录目标是否可见
+        self.target_visibility = torch.ones((self.num_envs,), device=self.device, dtype=gs.tc_float)
+        
+        # 上一帧的相对位置，用于处理目标丢失情况
+        self.last_visible_rel_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
 
     def _collision_detect(self):
         if self.n_obstacles > 0:
@@ -284,11 +365,72 @@ class TrackerEnv:
             return False
     
     def _loss_detect(self):
+        """
+        检测目标是否丢失（基于连续多帧遮挡）
+        
+        Returns:
+            bool: True表示目标丢失（连续多帧检测不到）
+        """
         if self.n_obstacles > 0:
-            bool, _, _ = occlusion_check(self.tracker_pos, self.target_pos, self.obs_xy, self.obs_r)
-            return bool
+            # 检测当前帧是否被遮挡
+            current_occluded, _, _ = occlusion_check(self.tracker_pos, self.target_pos, self.obs_xy, self.obs_r)
+            
+            # 更新连续遮挡计数器
+            self.consecutive_loss_count[current_occluded] += 1
+            self.consecutive_loss_count[~current_occluded] = 0  # 可见时重置计数
+            
+            # 只有连续多帧都遮挡才认为真正丢失
+            loss_flag = self.consecutive_loss_count >= self.loss_detection_threshold
+            return loss_flag
         else:
-            return False
+            self.consecutive_loss_count[:] = 0
+            return torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+    
+    def _update_trajectory_history(self):
+        """
+        更新目标的历史轨迹和可见性标签。
+        
+        处理逻辑:
+        1. 检测目标是否被遮挡(可见性标签v)
+        2. 如果可见(v=1)，记录当前相对位置
+        3. 如果不可见(v=0)，使用上一帧的可见位置或0填充
+        4. 将新数据加入历史buffer(FIFO队列形式)
+        """
+        # 检测目标可见性（是否被遮挡）
+        if self.n_obstacles > 0:
+            occlusion_flag, _, _ = occlusion_check(
+                self.tracker_pos, 
+                self.target_pos, 
+                self.obs_xy, 
+                self.obs_r
+            )
+            # occlusion_flag为True表示被遮挡，可见性为0；False表示可见，可见性为1
+            self.target_visibility = (~occlusion_flag).float()
+        else:
+            # 没有障碍物，总是可见
+            self.target_visibility = torch.ones((self.num_envs,), device=self.device, dtype=gs.tc_float)
+        
+        # 准备当前帧的轨迹数据: [rel_x, rel_y, rel_z, visibility]
+        current_frame = torch.zeros((self.num_envs, self.trajectory_input_size), device=self.device, dtype=gs.tc_float)
+        
+        # 相对位置处理：如果可见，使用当前位置；如果不可见，使用上一帧的可见位置
+        visible_mask = self.target_visibility.bool()  # (num_envs,)
+        
+        # 对于可见的环境，使用当前相对位置
+        current_frame[visible_mask, :3] = self.rel_pos[visible_mask]
+        self.last_visible_rel_pos[visible_mask] = self.rel_pos[visible_mask]
+        
+        # 对于不可见的环境，使用上一帧的可见位置
+        current_frame[~visible_mask, :3] = self.last_visible_rel_pos[~visible_mask]
+        
+        # 设置可见性标签
+        current_frame[:, 3] = self.target_visibility
+        
+        # 将历史轨迹向前滚动一帧(删除最旧的，添加最新的)
+        # 使用torch.roll实现FIFO队列
+        self.target_trajectory_history = torch.roll(self.target_trajectory_history, shifts=-1, dims=1)
+        # 将当前帧放入最后一个位置
+        self.target_trajectory_history[:, -1, :] = current_frame
 
 
     def step(self, actions):
@@ -360,6 +502,9 @@ class TrackerEnv:
         self.target_lin_vel[:] = transform_by_quat(self.target.get_vel(), inv_target_quat)
         self.target_ang_vel[:] = transform_by_quat(self.target.get_ang(), inv_target_quat)
 
+        # ! 更新目标轨迹历史和可见性
+        self._update_trajectory_history()
+
         # ! 更新可视化连接线
         if self.visualize_connection:
             self._update_connection_lines()
@@ -421,6 +566,19 @@ class TrackerEnv:
             feats["heading_clear_norm"],
             feats["sector_mins_norm"],   # if K>0
         ], dim=-1)                       # (N, 4+3+4+1+1+K)
+        
+        # ! 使用轨迹编码器编码历史轨迹
+        # 以stride=5采样，从50帧历史中提取10个样本，覆盖0.5秒
+        # 采样索引: [4, 9, 14, 19, 24, 29, 34, 39, 44, 49] (stride=5, 从第5帧开始)
+        sampled_indices = torch.arange(
+            self.trajectory_stride - 1,  # 从第5帧开始(index=4)
+            self.trajectory_history_length,  # 到第50帧
+            self.trajectory_stride,  # 每隔5帧
+            device=self.device
+        )
+        trajectory_sampled = self.target_trajectory_history[:, sampled_indices, :]  # (num_envs, 10, 4)
+        trajectory_features = self.trajectory_encoder(trajectory_sampled)  # (num_envs, hidden_size)
+        
         self.obs_buf = torch.cat(
             [
                 torch.clip(self.rel_pos * self.obs_scales["max_diff"], -1, 1),          # relative position
@@ -429,7 +587,8 @@ class TrackerEnv:
                 torch.clip(self.tracker_ang_vel * self.obs_scales["max_ang"], -1, 1),   # tracker angular velocity
                 torch.clip(self.target_lin_vel * self.obs_scales["max_lin"], -1, 1),    # target linear velocity
                 torch.clip(self.last_actions * self.obs_scales["max_lin"], -1, 1),      # last action
-                obs_env,                                                                # obstacle features 
+                obs_env,                                                                # obstacle features
+                trajectory_features,                                                     # 目标历史轨迹编码特征
             ],
             axis=-1,
         )
@@ -532,6 +691,14 @@ class TrackerEnv:
         self.last_actions[envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
+        
+        # ! 重置轨迹历史buffer
+        self.target_trajectory_history[envs_idx] = 0.0
+        self.target_visibility[envs_idx] = 1.0  # 初始假设目标可见
+        self.last_visible_rel_pos[envs_idx] = self.rel_pos[envs_idx]
+        
+        # ! 重置连续丢失计数器
+        self.consecutive_loss_count[envs_idx] = 0
 
         # ! -------------------------- set extras ------------------------------------
         self.extras["episode"] = {}
@@ -923,7 +1090,8 @@ class TrackerEnv:
             if collision_flag[idx]:
                 reasons.append("碰撞")
             if loss_flag[idx]:
-                reasons.append("丢失目标")
+                loss_count = self.consecutive_loss_count[idx].item()
+                reasons.append(f"丢失目标 (连续遮挡{loss_count}帧)")
             if pitch_flag[idx]:
                 pitch_val = self.tracker_euler[idx, 1].item() * 180 / 3.14159
                 reasons.append(f"俯仰角超限 ({pitch_val:.1f}°)")

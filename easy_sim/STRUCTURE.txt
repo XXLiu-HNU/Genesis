@@ -1,0 +1,95 @@
+==============================================================================
+                    Easy Sim 目录结构说明
+==============================================================================
+
+项目已重新组织，按功能分类到不同目录：
+
+目录结构
+--------
+easy_sim/
+├── core/                           核心模块
+│   ├── drone_dynamics_sim.py      无人机动力学仿真器
+│   ├── controller.py              PID控制器和状态估计器
+│   └── __init__.py                模块初始化
+│
+├── tests/                          测试脚本
+│   ├── test_drone_dynamics.py     动力学测试（8/8通过）
+│   ├── test_controller_debug.py   控制器调试
+│   ├── test_circle_tracking.py    圆形轨迹跟踪
+│   ├── test_position_control.py   位置控制调试
+│   ├── test_mixer_debug.py        混控器分析
+│   └── quick_test.py              快速验证
+│
+├── examples/                       示例代码
+│   ├── example_simple_usage.py    5个基本示例
+│   └── example_policy_sim2sim.py  策略sim2sim测试
+│
+├── docs/                           文档
+│   ├── README.md                  项目说明（主文档）
+│   ├── easy_sim_guide.md          使用指南
+│   ├── CONTROLLER_README.txt      控制器文档
+│   ├── controller_quick_start.txt 快速开始
+│   └── SUMMARY.txt                项目总结
+│
+├── results/                        测试结果
+│   ├── drone_trajectory.png       动力学仿真轨迹
+│   └── circle_tracking_results.png 圆形跟踪结果
+│
+├── __init__.py                     包初始化（导出核心类）
+└── STRUCTURE.txt                   本文件
+
+
+导入方式
+--------
+
+1. 从项目根目录导入（推荐）
+   from easy_sim import QuadrotorDynamics, PIDController, Odom
+
+2. 从core子模块导入
+   from easy_sim.core import QuadrotorDynamics
+   from easy_sim.core import PIDController, Odom
+
+3. 完整路径导入
+   from easy_sim.core.drone_dynamics_sim import QuadrotorDynamics
+   from easy_sim.core.controller import PIDController, Odom, load_pid_config
+
+
+运行测试
+--------
+
+方法1: 使用模块运行（推荐）
+   cd /path/to/Genesis
+   python -m easy_sim.tests.quick_test
+   python -m easy_sim.tests.test_drone_dynamics
+
+方法2: 直接运行（需要设置PYTHONPATH）
+   cd /path/to/Genesis/easy_sim/tests
+   PYTHONPATH=/path/to/Genesis python quick_test.py
+
+
+运行示例
+--------
+   cd /path/to/Genesis
+   python -m easy_sim.examples.example_simple_usage
+   python easy_sim/examples/example_simple_usage.py
+
+
+查看文档
+--------
+   cat easy_sim/README.md                      # 项目主文档
+   cat easy_sim/docs/CONTROLLER_README.txt     # 控制器文档
+   cat easy_sim/docs/controller_quick_start.txt # 快速开始
+
+
+优势
+----
+✓ 代码组织更清晰
+✓ 功能分类明确
+✓ 便于维护和扩展
+✓ 测试代码独立
+✓ 文档集中管理
+✓ 结果文件分离
+
+==============================================================================
+                      目录重组完成！
+==============================================================================

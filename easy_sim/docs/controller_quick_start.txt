@@ -1,0 +1,44 @@
+==============================================================================
+                  控制器快速开始 - 简明指南
+==============================================================================
+
+1. 测试悬停（推荐先运行）
+   python test_controller_debug.py
+   
+   预期：无人机保持在1m高度附近悬停
+
+2. 圆形轨迹跟踪
+   python test_circle_tracking.py --steps 1500 --radius 1.0
+   
+   生成：circle_tracking_results.png
+
+3. 基本使用示例
+   
+   from controller import Odom, PIDController, load_pid_config
+   from drone_dynamics_sim import QuadrotorDynamics
+   import numpy as np
+   
+   # 创建仿真器
+   sim = QuadrotorDynamics({'dt': 0.01})
+   sim.reset(position=[0, 0, 1.0])
+   
+   # 创建控制器
+   odom = Odom(num_envs=1)
+   odom.set_sim(sim)
+   config = load_pid_config()
+   controller = PIDController(1, odom, config, "position")
+   
+   # 控制循环
+   for step in range(1000):
+       target = np.array([[0.0, 0.0, 1.0, 0.0]])  # 悬停
+       motor_rpms = controller.step(target)
+       state = sim.step_rpm(motor_rpms[0])
+
+4. 三种控制模式
+
+   Position Control:  目标位置 -> RPM
+   Angle Control:     目标姿态 -> RPM
+   Rate Control:      目标角速率 -> RPM
+
+更多信息请查看 CONTROLLER_README.txt
+==============================================================================
