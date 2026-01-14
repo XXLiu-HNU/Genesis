@@ -23,8 +23,8 @@
       <geometry>
         <mesh filename="./body.obj" scale="1 1 1"/>
       </geometry> 
-      <material name="grey">
-        <color rgba=".5 .5 .5 1"/>
+      <material name="red">
+        <color rgba=".8 .0 .0 1"/>
       </material> 
     </visual>
 
