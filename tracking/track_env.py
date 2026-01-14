@@ -20,7 +20,9 @@ from utils import (
     occlusion_check, 
     setup_random_cylindrical_obstacles, 
     obstacle_features, 
-    collision_reward,
+    collision_reward, # 旧版，直接根据障碍物信息计算奖励
+    collision_reward_use_sensor, # 新版，根据传感器信息计算奖励
+    get_min_dist_and_dir,
     sample_free_xy_batch,
     sample_around_centers_batch,
 )
@@ -777,14 +779,14 @@ class TrackerEnv:
         return crash_rew
 
     def _reward_collision(self):
-
-        out = collision_reward(
-            tracker_pos=self.tracker_pos[:,:2],     # [N,dim]
-            tracker_vel=self.tracker_lin_vel[:,:2],     # [N,dim]
-            obs_centers=self.obs_xy,     # [M,dim]
-            obs_radii=self.obs_r,         # [M] or [M,1]
-        )
-        return out["rc"]
+        
+        # 简化版，直接获取最近障碍物信息
+        d_t, n_hat = get_min_dist_and_dir(self.tracker_pos[:,:2], self.obs_xy, self.obs_r) 
+        
+        # 新版，根据传感器信息计算奖励
+        result = collision_reward_use_sensor(self.tracker_pos[:,:2], self.tracker_lin_vel[:,:2], d_t, n_hat)
+        return result["rc"]
+        
     def _reward_distance_horizontal(self):
         """
         k: Softening factor for the boundary (larger values mean softer boundaries), recommended 10~50

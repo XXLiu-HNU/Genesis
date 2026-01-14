@@ -492,6 +492,7 @@ def obstacle_features(
         out["sector_mins_norm"] = sector_mins
 
     return out
+    
 def collision_reward(
     tracker_pos: torch.Tensor,   # [N,dim]
     tracker_vel: torch.Tensor,   # [N,dim]
@@ -558,3 +559,89 @@ def collision_reward(
 
     rc = buf + barrier
     return {"rc": rc, "d_t": d_t, "dtdot": dtdot, "idx": idx}
+
+def get_min_dist_and_dir(
+    tracker_pos: torch.Tensor,   # [N,dim]
+    obs_centers: torch.Tensor,   # [M,dim]
+    obs_radii: torch.Tensor,     # [M] or [M,1]
+    eps: float = 1e-9,
+):
+    """
+    计算追踪器到最近障碍物的距离和方向（辅助函数）。
+    可与 collision_reward_use_sensor 配合使用，将距离/方向计算与奖励计算解耦。
+    
+    返回：
+      d_t:    [N] 最近障碍边界净空
+      n_hat:  [N,dim] 最近障碍的外法向方向
+    """
+    device = tracker_pos.device
+    dtype  = tracker_pos.dtype
+    N      = tracker_pos.shape[0]
+
+    # --- 统一 obs_radii 形状 ---
+    if obs_radii.ndim == 2 and obs_radii.shape[1] == 1:
+        obs_radii = obs_radii.squeeze(1)  # [M]
+
+    # --- 计算到每个圆障碍边界的净空 d_t = ||p-c|| - r ---
+    R = tracker_pos.unsqueeze(1) - obs_centers.unsqueeze(0)   # [N,M,dim]
+    dist = torch.linalg.norm(R, dim=-1)                       # [N,M]
+    clearance = dist - obs_radii.view(1, -1)                  # [N,M]
+
+    d_t, idx = clearance.min(dim=1)                           # [N], [N]
+    R_min    = R[torch.arange(N, device=device), idx]         # [N,dim]
+    dist_min = dist[torch.arange(N, device=device), idx].clamp_min(eps)  # [N]
+    n_hat    = R_min / dist_min.unsqueeze(-1)                 # [N,dim] 障碍外法向
+    return d_t, n_hat
+
+def collision_reward_use_sensor(
+    tracker_pos: torch.Tensor,   # [N,dim]
+    tracker_vel: torch.Tensor,   # [N,dim]
+    min_dist: torch.Tensor,      # [N] 从传感器获取的最近障碍距离
+    min_dir:  torch.Tensor,      # [N,dim] 从传感器获取的最近障碍方向
+    safe_dist=0.5,               # 可以是 float/int/tuple/list/tensor；支持标量或 [N]
+    beta1: float = 1.0,
+    beta2: float = 10.0,
+):
+    """
+    使用传感器数据计算碰撞奖励（不需要显式的障碍物位置信息）。
+    
+    返回：
+      rc:      [N] 惩罚（越大越危险）
+      d_t:     [N] 最近障碍边界净空（即传入的 min_dist）
+      dtdot:   [N] 净空的时间导数（>0 远离，<0 接近）
+    """
+    device = tracker_pos.device
+    dtype  = tracker_pos.dtype
+    N      = tracker_pos.shape[0]
+
+    # \dot d_t = n_hat · v   （障碍静止）
+    dtdot = (min_dir * tracker_vel).sum(dim=-1)                 # [N]
+    v_c   = torch.clamp(-dtdot, min=0.0)                      # 只惩罚“接近”
+
+    # --- 统一/广播 d_s ---
+    # 接受 float/int/tuple/list/tensor；把它变成与 d_t 可广播的张量
+    if isinstance(safe_dist, (tuple, list)):
+        # 常见的 (0.6,) 情况
+        if len(safe_dist) == 1:
+            safe_dist = safe_dist[0]
+        else:
+            safe_dist = torch.as_tensor(safe_dist, device=device, dtype=dtype)
+    if not torch.is_tensor(safe_dist):
+        safe_dist = torch.tensor(safe_dist, device=device, dtype=dtype)
+
+    # 若 safe_dist 是标量，自动扩展到 [N]
+    if safe_dist.ndim == 0:
+        safe_dist = safe_dist.expand_as(min_dist)           # [N]
+    elif safe_dist.ndim == 1:
+        # 允许 [N]；若是 [1] 也能广播
+        assert safe_dist.shape[0] in (1, N), f"safe_dist shape {safe_dist.shape} must be [N] or [1] or scalar."
+
+    # --- 缓冲项 + softplus 屏障 ---
+    # 缓冲项：v_c * [max(1 - (min_dist - d_s), 0)]^2
+    buf = v_c * torch.relu(1.0 - (min_dist - safe_dist))**2
+
+    # 屏障：beta1 * softplus(beta2 * (d_s - min_dist))
+    barrier = beta1 * F.softplus(beta2 * (safe_dist - min_dist), beta=1.0)
+
+    rc = buf + barrier
+    return {"rc": rc, "d_t": min_dist, "dtdot": dtdot}
