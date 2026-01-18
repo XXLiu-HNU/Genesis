@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import trimesh
 
 import gstaichi as ti
 
@@ -62,7 +63,7 @@ class Collider:
         self._support_field = SupportField(rigid_solver, is_active=self._mpr.is_active or self._gjk.is_active)
 
         if gs.use_zerocopy:
-            self._contacts_info: dict[str, torch.Tensor] = {}
+            self._contact_data: dict[str, torch.Tensor] = {}
             for key, name in (
                 ("link_a", "link_a"),
                 ("link_b", "link_b"),
@@ -73,7 +74,7 @@ class Collider:
                 ("normal", "normal"),
                 ("force", "force"),
             ):
-                self._contacts_info[key] = ti_to_torch(
+                self._contact_data[key] = ti_to_torch(
                     getattr(self._collider_state.contact_data, name), transpose=True, copy=False
                 )
 
@@ -176,8 +177,8 @@ class Collider:
             self._collider_static_config,
         )
 
-        # 'contacts_info_cache' is not used in Taichi kernels, so keep it outside of the collider state / info
-        self._contacts_info_cache: dict[tuple[bool, bool], dict[str, torch.Tensor | tuple[torch.Tensor]]] = {}
+        # 'contact_data_cache' is not used in Taichi kernels, so keep it outside of the collider state / info
+        self._contact_data_cache: dict[tuple[bool, bool], dict[str, torch.Tensor | tuple[torch.Tensor]]] = {}
 
         self.reset()
 
@@ -186,11 +187,13 @@ class Collider:
         Compute flat indices of all valid collision pairs.
 
         For each pair of geoms, determine if they can collide based on their properties and the solver configuration.
+        Pairs that are already colliding at the initial configuration (qpos0) are filtered out with a warning.
         """
         solver = self._solver
         n_geoms = solver.n_geoms_
         n_equalities = solver.n_equalities
         enable_self_collision = solver._enable_self_collision
+        enable_neutral_collision = solver._enable_neutral_collision
         enable_adjacent_collision = solver._enable_adjacent_collision
         batch_links_info = solver._static_rigid_sim_config.batch_links_info
 
@@ -211,6 +214,18 @@ class Collider:
             links_is_fixed = links_is_fixed[:, 0]
         entities_is_local_collision_mask = solver.entities_info.is_local_collision_mask.to_numpy()
 
+        # Compute vertices all geometries, shrunk by 0.1% to avoid false positive when detecting self-collision
+        geoms_verts: list[np.ndarray] = []
+        for geom in solver.geoms:
+            verts = tensor_to_array(geom.get_verts())
+            verts = verts.reshape((-1, *verts.shape[-2:]))
+            centroid = verts.mean(axis=1, keepdims=True)
+            verts = centroid + (1.0 - 1e-3) * (verts - centroid)
+            geoms_verts.append(verts)
+
+        # Track pairs that are colliding in neutral configuration for warning
+        self_colliding_pairs: list[tuple[int, int]] = []
+
         n_possible_pairs = 0
         collision_pair_idx = np.full((n_geoms, n_geoms), fill_value=-1, dtype=gs.np_int)
         for i_ga in range(n_geoms):
@@ -224,17 +239,6 @@ class Collider:
                 if i_la == i_lb:
                     continue
 
-                # self collision
-                if links_root_idx[i_la] == links_root_idx[i_lb]:
-                    if not enable_self_collision:
-                        continue
-
-                    # adjacent links
-                    if not enable_adjacent_collision and (
-                        links_parent_idx[i_la] == i_lb or links_parent_idx[i_lb] == i_la
-                    ):
-                        continue
-
                 # Filter out right away weld constraint that have been declared statically and cannot be removed
                 is_valid = True
                 for i_eq in range(n_equalities):
@@ -246,10 +250,9 @@ class Collider:
                     continue
 
                 # contype and conaffinity
-                if (
-                    (i_ea == i_eb)
-                    or not (entities_is_local_collision_mask[i_ea] or entities_is_local_collision_mask[i_eb])
-                ) and not (
+                mask_ea = entities_is_local_collision_mask[i_ea]
+                mask_eb = entities_is_local_collision_mask[i_eb]
+                if ((i_ea == i_eb) or not (mask_ea or mask_eb)) and not (
                     (geoms_contype[i_ga] & geoms_conaffinity[i_gb]) or (geoms_contype[i_gb] & geoms_conaffinity[i_ga])
                 ):
                     continue
@@ -258,8 +261,48 @@ class Collider:
                 if links_is_fixed[i_la] and links_is_fixed[i_lb]:
                     continue
 
+                # self collision
+                if links_root_idx[i_la] == links_root_idx[i_lb]:
+                    if not enable_self_collision:
+                        continue
+
+                    # adjacent links
+                    if not enable_adjacent_collision and (
+                        links_parent_idx[i_la] == i_lb or links_parent_idx[i_lb] == i_la
+                    ):
+                        continue
+
+                    # active in neutral configuration (qpos0)
+                    is_self_colliding = False
+                    for i_b in range(1 if not enable_neutral_collision else 0):
+                        mesh_a = trimesh.Trimesh(
+                            vertices=geoms_verts[i_ga][i_b], faces=solver.geoms[i_ga].init_faces, process=False
+                        )
+                        mesh_b = trimesh.Trimesh(
+                            vertices=geoms_verts[i_gb][i_b], faces=solver.geoms[i_gb].init_faces, process=False
+                        )
+                        bounds_a, bounds_b = mesh_a.bounds, mesh_b.bounds
+                        if not ((bounds_a[1] < bounds_b[0]).any() or (bounds_b[1] < bounds_a[0]).any()):
+                            if (mesh_a.is_watertight and mesh_a.contains(mesh_b.vertices).any()) or (
+                                mesh_b.is_watertight and mesh_b.contains(mesh_a.vertices).any()
+                            ):
+                                is_self_colliding = True
+                                self_colliding_pairs.append((i_ga, i_gb))
+                                break
+                    if is_self_colliding:
+                        continue
+
                 collision_pair_idx[i_ga, i_gb] = n_possible_pairs
                 n_possible_pairs = n_possible_pairs + 1
+
+        # Emit warning for self-collision pairs
+        if self_colliding_pairs:
+            pairs = ", ".join((f"({i_ga}, {i_gb})") for i_ga, i_gb in self_colliding_pairs)
+            gs.logger.warning(
+                f"Filtered out geometry pairs causing self-collision for the neutral configuration (qpos0): {pairs}. "
+                "Consider tuning Morph option 'decompose_robot_error_threshold' or specify dedicated collision meshes. "
+                "This behavior can be disabled by setting Morph option 'enable_neutral_collision=True'."
+            )
 
         return n_possible_pairs, collision_pair_idx
 
@@ -326,7 +369,7 @@ class Collider:
             self._collider_info.terrain_xyz_maxmin.from_numpy(xyz_maxmin)
 
     def reset(self, envs_idx=None, *, cache_only: bool = True) -> None:
-        self._contacts_info_cache.clear()
+        self._contact_data_cache.clear()
         if gs.use_zerocopy:
             envs_idx = slice(None) if envs_idx is None else envs_idx
             if not cache_only:
@@ -375,7 +418,7 @@ class Collider:
         if self._n_possible_pairs == 0:
             return
 
-        self._contacts_info_cache.clear()
+        self._contact_data_cache.clear()
         func_broad_phase(
             self._solver.links_state,
             self._solver.links_info,
@@ -462,9 +505,9 @@ class Collider:
 
     def get_contacts(self, as_tensor: bool = True, to_torch: bool = True, keep_batch_dim: bool = False):
         # Early return if already pre-computed
-        contacts_info = self._contacts_info_cache.setdefault((as_tensor, to_torch), {})
-        if contacts_info:
-            return contacts_info.copy()
+        contact_data = self._contact_data_cache.setdefault((as_tensor, to_torch), {})
+        if contact_data:
+            return contact_data.copy()
 
         n_envs = self._solver.n_envs
         if gs.use_zerocopy:
@@ -472,26 +515,27 @@ class Collider:
             if as_tensor or n_envs == 0:
                 n_contacts_max = (n_contacts if n_envs == 0 else n_contacts.max()).item()
 
-            for key, data in self._contacts_info.items():
+            for key, data in self._contact_data.items():
                 if n_envs == 0:
                     data = data[0, :n_contacts_max] if not keep_batch_dim else data[:, :n_contacts_max]
-                    if not to_torch:
-                        data = tensor_to_array(data)
-                else:
-                    if as_tensor:
-                        data = data[:, :n_contacts_max]
-                        if not to_torch:
-                            data = tensor_to_array(data)
-                    else:
-                        if not to_torch:
-                            data = tensor_to_array(data)
-                        if keep_batch_dim:
-                            data = tuple([data[i : i + 1, :j] for i, j in enumerate(n_contacts.tolist())])
-                        else:
-                            data = tuple([data[i, :j] for i, j in enumerate(n_contacts.tolist())])
-                contacts_info[key] = data
+                elif as_tensor:
+                    data = data[:, :n_contacts_max]
 
-            return contacts_info.copy()
+                if to_torch:
+                    if gs.backend == gs.cpu:
+                        data = data.clone()
+                else:
+                    data = tensor_to_array(data)
+
+                if n_envs > 0 and not as_tensor:
+                    if keep_batch_dim:
+                        data = tuple([data[i : i + 1, :j] for i, j in enumerate(n_contacts.tolist())])
+                    else:
+                        data = tuple([data[i, :j] for i, j in enumerate(n_contacts.tolist())])
+
+                contact_data[key] = data
+
+            return contact_data.copy()
 
         # Find out how much dynamic memory must be allocated
         n_contacts = ti_to_numpy(self._collider_state.n_contacts)
@@ -558,11 +602,11 @@ class Collider:
                     values = (*iout_chunks, *fout_chunks)
 
         # Store contact information in cache
-        contacts_info.update(
+        contact_data.update(
             zip(("link_a", "link_b", "geom_a", "geom_b", "penetration", "position", "normal", "force"), values)
         )
 
-        return contacts_info.copy()
+        return contact_data.copy()
 
     def backward(self, dL_dposition, dL_dnormal, dL_dpenetration):
         func_set_upstream_grad(dL_dposition, dL_dnormal, dL_dpenetration, self._collider_state)
@@ -770,6 +814,7 @@ def func_contact_sphere_sdf(
     i_b,
     geoms_state: array_class.GeomsState,
     geoms_info: array_class.GeomsInfo,
+    rigid_global_info: array_class.RigidGlobalInfo,
     collider_static_config: ti.template(),
     sdf_info: array_class.SDFInfo,
 ):
@@ -859,7 +904,6 @@ def func_contact_edge_sdf(
     for i_e in range(geoms_info.edge_start[i_ga], geoms_info.edge_end[i_ga]):
         cur_length = edges_info.length[i_e]
         if cur_length > ga_sdf_cell_size:
-
             i_v0 = edges_info.v0[i_e]
             i_v1 = edges_info.v1[i_e]
 
@@ -889,10 +933,8 @@ def func_contact_edge_sdf(
             normal_edge_1 = sdf_grad_1_a - sdf_grad_1_a.dot(vec_01) * vec_01
 
             if normal_edge_0.dot(sdf_grad_0_b) < 0 or normal_edge_1.dot(sdf_grad_1_b) < 0:
-
                 # check if closest point is between the two points
                 if sdf_grad_0_b.dot(vec_01) < 0 and sdf_grad_1_b.dot(vec_01) > 0:
-
                     while cur_length > ga_sdf_cell_size:
                         p_mid = 0.5 * (p_0 + p_1)
                         if (
@@ -1350,6 +1392,7 @@ def func_broad_phase(
     potential collision pairs based on the AABB overlap.
     """
     n_geoms, _B = collider_state.active_buffer.shape
+    n_links = links_info.geom_start.shape[0]
 
     # Clear collider state
     func_collision_clear(links_state, links_info, collider_state, static_rigid_sim_config)
@@ -1358,26 +1401,37 @@ def func_broad_phase(
     for i_b in range(_B):
         axis = 0
 
+        # Calculate the number of active geoms for this environment
+        # (for heterogeneous entities, different envs may have different geoms)
+        env_n_geoms = 0
+        for i_l in range(n_links):
+            I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
+            env_n_geoms = env_n_geoms + links_info.geom_end[I_l] - links_info.geom_start[I_l]
+
         # copy updated geom aabbs to buffer for sorting
         if collider_state.first_time[i_b]:
-            for i in range(n_geoms):
-                collider_state.sort_buffer.value[2 * i, i_b] = geoms_state.aabb_min[i, i_b][axis]
-                collider_state.sort_buffer.i_g[2 * i, i_b] = i
-                collider_state.sort_buffer.is_max[2 * i, i_b] = False
+            i_buffer = 0
+            for i_l in range(n_links):
+                I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
+                for i_g in range(links_info.geom_start[I_l], links_info.geom_end[I_l]):
+                    collider_state.sort_buffer.value[2 * i_buffer, i_b] = geoms_state.aabb_min[i_g, i_b][axis]
+                    collider_state.sort_buffer.i_g[2 * i_buffer, i_b] = i_g
+                    collider_state.sort_buffer.is_max[2 * i_buffer, i_b] = False
 
-                collider_state.sort_buffer.value[2 * i + 1, i_b] = geoms_state.aabb_max[i, i_b][axis]
-                collider_state.sort_buffer.i_g[2 * i + 1, i_b] = i
-                collider_state.sort_buffer.is_max[2 * i + 1, i_b] = True
+                    collider_state.sort_buffer.value[2 * i_buffer + 1, i_b] = geoms_state.aabb_max[i_g, i_b][axis]
+                    collider_state.sort_buffer.i_g[2 * i_buffer + 1, i_b] = i_g
+                    collider_state.sort_buffer.is_max[2 * i_buffer + 1, i_b] = True
 
-                geoms_state.min_buffer_idx[i, i_b] = 2 * i
-                geoms_state.max_buffer_idx[i, i_b] = 2 * i + 1
+                    geoms_state.min_buffer_idx[i_buffer, i_b] = 2 * i_g
+                    geoms_state.max_buffer_idx[i_buffer, i_b] = 2 * i_g + 1
+                    i_buffer = i_buffer + 1
 
             collider_state.first_time[i_b] = False
 
         else:
             # warm start. If `use_hibernation=True`, it's already updated in rigid_solver.
             if ti.static(not static_rigid_sim_config.use_hibernation):
-                for i in range(n_geoms * 2):
+                for i in range(env_n_geoms * 2):
                     if collider_state.sort_buffer.is_max[i, i_b]:
                         collider_state.sort_buffer.value[i, i_b] = geoms_state.aabb_max[
                             collider_state.sort_buffer.i_g[i, i_b], i_b
@@ -1388,7 +1442,7 @@ def func_broad_phase(
                         ][axis]
 
         # insertion sort, which has complexity near O(n) for nearly sorted array
-        for i in range(1, 2 * n_geoms):
+        for i in range(1, 2 * env_n_geoms):
             key_value = collider_state.sort_buffer.value[i, i_b]
             key_is_max = collider_state.sort_buffer.is_max[i, i_b]
             key_i_g = collider_state.sort_buffer.i_g[i, i_b]
@@ -1420,7 +1474,7 @@ def func_broad_phase(
         n_broad = 0
         if ti.static(not static_rigid_sim_config.use_hibernation):
             n_active = 0
-            for i in range(2 * n_geoms):
+            for i in range(2 * env_n_geoms):
                 if not collider_state.sort_buffer.is_max[i, i_b]:
                     for j in range(n_active):
                         i_ga = collider_state.active_buffer[j, i_b]
@@ -1451,7 +1505,7 @@ def func_broad_phase(
                             continue
 
                         if n_broad == collider_info.max_collision_pairs_broad[None]:
-                            errno[None] = errno[None] | 0b00000000000000000000000000000001
+                            errno[i_b] = errno[i_b] | 0b00000000000000000000000000000001
                             break
                         collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                         collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
@@ -1472,7 +1526,7 @@ def func_broad_phase(
             if rigid_global_info.n_awake_dofs[i_b] > 0:
                 n_active_awake = 0
                 n_active_hib = 0
-                for i in range(2 * n_geoms):
+                for i in range(2 * env_n_geoms):
                     is_incoming_geom_hibernated = geoms_state.hibernated[collider_state.sort_buffer.i_g[i, i_b], i_b]
 
                     if not collider_state.sort_buffer.is_max[i, i_b]:
@@ -2176,7 +2230,7 @@ def func_add_contact(
 
         collider_state.n_contacts[i_b] = i_c + 1
     else:
-        errno[None] = errno[None] | 0b00000000000000000000000000000010
+        errno[i_b] = errno[i_b] | 0b00000000000000000000000000000010
 
 
 @ti.func

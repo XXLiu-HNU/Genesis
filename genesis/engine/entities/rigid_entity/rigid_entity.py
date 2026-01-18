@@ -1,8 +1,8 @@
+import inspect
 from copy import copy
 from itertools import chain
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Any
 from functools import wraps
-import inspect
 
 import gstaichi as ti
 import numpy as np
@@ -20,7 +20,7 @@ from genesis.utils import mesh as mu
 from genesis.utils import mjcf as mju
 from genesis.utils import terrain as tu
 from genesis.utils import urdf as uu
-from genesis.utils.misc import DeprecationError, broadcast_tensor, sanitize_index, ti_to_torch
+from genesis.utils.misc import DeprecationError, broadcast_tensor, ti_to_torch
 from genesis.engine.states.entities import RigidEntityState
 
 from ..base_entity import Entity
@@ -48,6 +48,68 @@ def tracked(fun):
         return fun(self, *args, **kwargs)
 
     return wrapper
+
+
+def compute_inertial_from_geom_infos(cg_infos, vg_infos, rho):
+    """
+    Compute inertial properties (mass, center of mass, inertia tensor) from geometry infos.
+
+    This is a standalone helper function that computes combined inertial properties from
+    a collection of collision and/or visual geometry infos.
+
+    Parameters
+    ----------
+    cg_infos : list[dict]
+        List of collision geometry info dicts, each containing 'mesh', 'pos', 'quat'.
+    vg_infos : list[dict]
+        List of visual geometry info dicts, each containing 'vmesh', 'pos', 'quat'.
+        Used as fallback if cg_infos is empty.
+    rho : float
+        Material density (kg/m^3) used to compute mass from volume.
+
+    Returns
+    -------
+    tuple[float, np.ndarray, np.ndarray]
+        (total_mass, center_of_mass, inertia_tensor)
+    """
+    from genesis.utils.urdf import compose_inertial_properties, rotate_inertia
+
+    total_mass = gs.EPS
+    total_com = np.zeros(3, dtype=gs.np_float)
+    total_inertia = np.zeros((3, 3), dtype=gs.np_float)
+
+    # Use collision geoms if available, otherwise fall back to visual geoms
+    g_infos = cg_infos if cg_infos else vg_infos
+    mesh_key = "mesh" if cg_infos else "vmesh"
+
+    for g_info in g_infos:
+        mesh = g_info.get(mesh_key)
+        if mesh is None:
+            continue
+        geom_pos = g_info.get("pos", gu.zero_pos())
+        geom_quat = g_info.get("quat", gu.identity_quat())
+
+        inertia_mesh = mesh.trimesh
+        if not inertia_mesh.is_watertight:
+            inertia_mesh = trimesh.convex.convex_hull(inertia_mesh)
+
+        if inertia_mesh.volume < -gs.EPS:
+            inertia_mesh.invert()
+
+        geom_mass = inertia_mesh.volume * rho
+        geom_com_local = np.array(inertia_mesh.center_mass, dtype=gs.np_float)
+        geom_inertia_local = inertia_mesh.moment_inertia / inertia_mesh.mass * geom_mass
+
+        # Transform geom properties to link frame
+        geom_com_link = gu.transform_by_quat(geom_com_local, geom_quat) + geom_pos
+        geom_inertia_link = rotate_inertia(geom_inertia_local, gu.quat_to_R(geom_quat))
+
+        # Compose with existing properties
+        total_mass, total_com, total_inertia = compose_inertial_properties(
+            total_mass, total_com, total_inertia, geom_mass, geom_com_link, geom_inertia_link
+        )
+
+    return total_mass, total_com, total_inertia
 
 
 @ti.data_oriented
@@ -84,6 +146,7 @@ class RigidEntity(Entity):
         vface_start=0,
         equality_start=0,
         visualize_contact: bool = False,
+        morph_heterogeneous: list[Morph] | None = None,
     ):
         super().__init__(idx, scene, morph, solver, material, surface)
 
@@ -114,6 +177,10 @@ class RigidEntity(Entity):
 
         self._is_built: bool = False
 
+        # Heterogeneous simulation support (convert None to [] for consistency)
+        self._morph_heterogeneous = morph_heterogeneous if morph_heterogeneous is not None else []
+        self._enable_heterogeneous = bool(self._morph_heterogeneous)
+
         self._load_model()
 
         # Initialize target variables and checkpoint
@@ -133,26 +200,137 @@ class RigidEntity(Entity):
     def init_ckpt(self):
         pass
 
+    def _load_morph(self, morph: Morph):
+        """Load a single morph into the entity."""
+        # Store g_infos for heterogeneous inertial computation
+        self._first_g_infos = None
+        if isinstance(morph, gs.morphs.Mesh):
+            self._first_g_infos = self._load_mesh(morph, self._surface)
+        elif isinstance(morph, (gs.morphs.MJCF, gs.morphs.URDF, gs.morphs.Drone, gs.morphs.USD)):
+            self._load_scene(morph, self._surface)
+        elif isinstance(morph, gs.morphs.Primitive):
+            self._first_g_infos = self._load_primitive(morph, self._surface)
+        elif isinstance(morph, gs.morphs.Terrain):
+            self._load_terrain(morph, self._surface)
+        else:
+            gs.raise_exception(f"Unsupported morph: {morph}.")
+
+        # Load heterogeneous variants (if any)
+        self._load_heterogeneous_morphs()
+
+    def _load_heterogeneous_morphs(self):
+        """
+        Load heterogeneous morphs (additional geometry variants for parallel environments).
+        Each variant is loaded as additional geoms/vgeoms attached to the single link.
+        """
+        if not self._enable_heterogeneous:
+            return
+
+        # Initialize tracking lists for geom/vgeom ranges per variant.
+        # These store the start/end indices for each variant's geoms and vgeoms,
+        # enabling per-environment dispatch during simulation.
+        self.variants_link_start = gs.List()
+        self.variants_link_end = gs.List()
+        self.variants_n_links = gs.List()
+        self.variants_geom_start = gs.List()
+        self.variants_geom_end = gs.List()
+        self.variants_vgeom_start = gs.List()
+        self.variants_vgeom_end = gs.List()
+        self.variants_inertial_mass = gs.List()
+        self.variants_inertial_pos = gs.List()
+        self.variants_inertial_i = gs.List()
+
+        # Record the first variant (the main morph)
+        self.variants_link_start.append(self._link_start)
+        self.variants_n_links.append(len(self._links))
+        self.variants_link_end.append(self._link_start + len(self._links))
+        self.variants_geom_start.append(self._geom_start)
+        first_variant_geom_end = self._geom_start + len(self.geoms)
+        self.variants_geom_end.append(first_variant_geom_end)
+        self.variants_vgeom_start.append(self._vgeom_start)
+        self.variants_vgeom_end.append(self._vgeom_start + len(self.vgeoms))
+        # Store number of geoms in first variant for balanced block distribution across environments
+        self._first_variant_n_geoms = len(self.geoms)
+        self._first_variant_n_vgeoms = len(self.vgeoms)
+
+        # Heterogeneous simulation only supports single-link entities.
+        if len(self._links) != 1:
+            gs.raise_exception("morph_heterogeneous only supports single-link entities.")
+
+        link = self._links[0]
+
+        # Compute first variant's inertial properties using stored g_infos
+        cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(self._morph, self._first_g_infos, False)
+        het_mass, het_pos, het_i = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
+        self.variants_inertial_mass.append(het_mass)
+        self.variants_inertial_pos.append(het_pos)
+        self.variants_inertial_i.append(het_i)
+
+        # Load additional heterogeneous variants
+        for morph in self._morph_heterogeneous:
+            if isinstance(morph, gs.morphs.Mesh):
+                g_infos = self._load_mesh(morph, self._surface, load_geom_only_for_heterogeneous=True)
+            elif isinstance(morph, gs.morphs.Primitive):
+                g_infos = self._load_primitive(morph, self._surface, load_geom_only_for_heterogeneous=True)
+            else:
+                gs.raise_exception(
+                    f"morph_heterogeneous only supports Primitive and Mesh, got: {type(morph).__name__}."
+                )
+
+            cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(morph, g_infos, False)
+
+            # Compute inertial properties for this variant from collision or visual geometries
+            het_mass, het_pos, het_i = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
+            self.variants_inertial_mass.append(het_mass)
+            self.variants_inertial_pos.append(het_pos)
+            self.variants_inertial_i.append(het_i)
+
+            # Add visual geometries
+            for g_info in vg_infos:
+                link._add_vgeom(
+                    vmesh=g_info["vmesh"],
+                    init_pos=g_info.get("pos", gu.zero_pos()),
+                    init_quat=g_info.get("quat", gu.identity_quat()),
+                )
+
+            # Add collision geometries
+            for g_info in cg_infos:
+                friction = self.material.friction
+                if friction is None:
+                    friction = g_info.get("friction", gu.default_friction())
+                link._add_geom(
+                    mesh=g_info["mesh"],
+                    init_pos=g_info.get("pos", gu.zero_pos()),
+                    init_quat=g_info.get("quat", gu.identity_quat()),
+                    type=g_info["type"],
+                    friction=friction,
+                    sol_params=g_info["sol_params"],
+                    data=g_info.get("data"),
+                    needs_coup=self.material.needs_coup,
+                    contype=g_info["contype"],
+                    conaffinity=g_info["conaffinity"],
+                )
+
+            # Record ranges for this variant
+            self.variants_link_start.append(self.variants_link_end[-1])
+            self.variants_link_end.append(self._link_start + len(self._links))
+            self.variants_n_links.append(self.variants_link_end[-1] - self.variants_link_start[-1])
+            self.variants_geom_start.append(self.variants_geom_end[-1])
+            self.variants_geom_end.append(self.variants_geom_end[-1] + len(cg_infos))
+            self.variants_vgeom_start.append(self.variants_vgeom_end[-1])
+            self.variants_vgeom_end.append(self.variants_vgeom_end[-1] + len(vg_infos))
+
     def _load_model(self):
         self._links = gs.List()
         self._joints = gs.List()
         self._equalities = gs.List()
 
-        if isinstance(self._morph, gs.morphs.Mesh):
-            self._load_mesh(self._morph, self._surface)
-        elif isinstance(self._morph, (gs.morphs.MJCF, gs.morphs.URDF, gs.morphs.Drone)):
-            self._load_scene(self._morph, self._surface)
-        elif isinstance(self._morph, gs.morphs.Primitive):
-            self._load_primitive(self._morph, self._surface)
-        elif isinstance(self._morph, gs.morphs.Terrain):
-            self._load_terrain(self._morph, self._surface)
-        else:
-            gs.raise_exception(f"Unsupported morph: {self._morph}.")
+        self._load_morph(self._morph)
 
         self._requires_jac_and_IK = self._morph.requires_jac_and_IK
         self._is_local_collision_mask = isinstance(self._morph, gs.morphs.MJCF)
 
-    def _load_primitive(self, morph, surface):
+    def _load_primitive(self, morph, surface, load_geom_only_for_heterogeneous=False):
         if morph.fixed:
             joint_type = gs.JOINT_TYPE.FIXED
             n_qs = 0
@@ -164,6 +342,8 @@ class RigidEntity(Entity):
             n_dofs = 6
             init_qpos = np.concatenate([morph.pos, morph.quat])
 
+        metadata: dict[str, Any] = {"texture_path": None}
+
         if isinstance(morph, gs.options.morphs.Box):
             extents = np.array(morph.size)
             tmesh = mu.create_box(extents=extents)
@@ -171,27 +351,29 @@ class RigidEntity(Entity):
             geom_data = extents
             geom_type = gs.GEOM_TYPE.BOX
             link_name_prefix = "box"
-
         elif isinstance(morph, gs.options.morphs.Sphere):
             tmesh = mu.create_sphere(radius=morph.radius)
             cmesh = tmesh
             geom_data = np.array([morph.radius])
             geom_type = gs.GEOM_TYPE.SPHERE
             link_name_prefix = "sphere"
-
         elif isinstance(morph, gs.options.morphs.Cylinder):
             tmesh = mu.create_cylinder(radius=morph.radius, height=morph.height)
             cmesh = tmesh
             geom_data = None
             geom_type = gs.GEOM_TYPE.MESH
             link_name_prefix = "cylinder"
-
         elif isinstance(morph, gs.options.morphs.Plane):
-            tmesh, cmesh = mu.create_plane(normal=morph.normal, plane_size=morph.plane_size, tile_size=morph.tile_size)
+            metadata["texture_path"] = mu.DEFAULT_PLANE_TEXTURE_PATH
+            tmesh, cmesh = mu.create_plane(
+                normal=morph.normal,
+                plane_size=morph.plane_size,
+                tile_size=morph.tile_size,
+                color_or_texture=metadata["texture_path"],
+            )
             geom_data = np.array(morph.normal)
             geom_type = gs.GEOM_TYPE.PLANE
             link_name_prefix = "plane"
-
         else:
             gs.raise_exception("Unsupported primitive shape")
 
@@ -202,7 +384,7 @@ class RigidEntity(Entity):
                 dict(
                     contype=0,
                     conaffinity=0,
-                    vmesh=gs.Mesh.from_trimesh(tmesh, surface=surface),
+                    vmesh=gs.Mesh.from_trimesh(tmesh, surface=surface, metadata=metadata),
                 )
             )
         if (morph.contype or morph.conaffinity) and morph.collision:
@@ -216,6 +398,10 @@ class RigidEntity(Entity):
                     sol_params=gu.default_solver_params(),
                 )
             )
+
+        # For heterogeneous simulation, only return geometry info without creating link/joint
+        if load_geom_only_for_heterogeneous:
+            return g_infos
 
         self._add_by_info(
             l_info=dict(
@@ -240,8 +426,9 @@ class RigidEntity(Entity):
             morph=morph,
             surface=surface,
         )
+        return g_infos
 
-    def _load_mesh(self, morph, surface):
+    def _load_mesh(self, morph, surface, load_geom_only_for_heterogeneous=False):
         if morph.fixed:
             joint_type = gs.JOINT_TYPE.FIXED
             n_qs = 0
@@ -287,6 +474,10 @@ class RigidEntity(Entity):
                     )
                 )
 
+        # For heterogeneous simulation, only return geometry info without creating link/joint
+        if load_geom_only_for_heterogeneous:
+            return g_infos
+
         link_name = morph.file.rsplit("/", 1)[-1].replace(".", "_")
 
         self._add_by_info(
@@ -312,6 +503,7 @@ class RigidEntity(Entity):
             morph=morph,
             surface=surface,
         )
+        return g_infos
 
     def _load_terrain(self, morph, surface):
         vmesh, mesh, self.terrain_hf = tu.parse_terrain(morph, surface)
@@ -371,11 +563,10 @@ class RigidEntity(Entity):
         if isinstance(morph, gs.morphs.MJCF):
             # Mujoco's unified MJCF+URDF parser systematically for MJCF files
             l_infos, links_j_infos, links_g_infos, eqs_info = mju.parse_xml(morph, surface)
-        else:
+        elif isinstance(morph, (gs.morphs.URDF, gs.morphs.Drone)):
             # Custom "legacy" URDF parser for loading geometries (visual and collision) and equality constraints.
             # This is necessary because Mujoco cannot parse visual geometries (meshes) reliably for URDF.
             l_infos, links_j_infos, links_g_infos, eqs_info = uu.parse_urdf(morph, surface)
-
             # Mujoco's unified MJCF+URDF parser for only link, joints, and collision geometries properties.
             morph_ = copy(morph)
             morph_.visualization = False
@@ -416,7 +607,11 @@ class RigidEntity(Entity):
                             link_g_infos.append(g_info)
             except (ValueError, AssertionError):
                 gs.logger.info("Falling back to legacy URDF parser. Default values of physics properties may be off.")
+        elif isinstance(morph, gs.morphs.USD):
+            from genesis.utils.usd import parse_usd_rigid_entity
 
+            # Unified parser handles both articulations and rigid bodies
+            l_infos, links_j_infos, links_g_infos, eqs_info = parse_usd_rigid_entity(morph, surface)
         # Add free floating joint at root if necessary
         if (
             (isinstance(morph, gs.morphs.Drone) or (isinstance(morph, gs.morphs.URDF) and not morph.fixed))
@@ -546,7 +741,7 @@ class RigidEntity(Entity):
         for l_info, link_j_infos, link_g_infos in zip(l_infos, links_j_infos, links_g_infos):
             if l_info["parent_idx"] < 0:
                 if morph.pos is not None or morph.quat is not None:
-                    gs.logger.info("Applying offset to base link's pose with user provided value in morph.")
+                    gs.logger.debug("Applying offset to base link's pose with user provided value in morph.")
                     pos = np.asarray(l_info.get("pos", (0.0, 0.0, 0.0)))
                     quat = np.asarray(l_info.get("quat", (1.0, 0.0, 0.0, 0.0)))
                     if morph.pos is None:
@@ -589,6 +784,8 @@ class RigidEntity(Entity):
         self._n_qs = self.n_qs
         self._n_dofs = self.n_dofs
         self._n_geoms = self.n_geoms
+        self._geoms = self.geoms
+        self._vgeoms = self.vgeoms
         self._is_built = True
 
         verts_start = 0
@@ -606,9 +803,6 @@ class RigidEntity(Entity):
             self._fixed_verts_idx_local = torch.cat(fixed_verts_idx_local)
         self._n_free_verts = len(self._free_verts_idx_local)
         self._n_fixed_verts = len(self._fixed_verts_idx_local)
-
-        self._geoms = self.geoms
-        self._vgeoms = self.vgeoms
 
         self._init_jac_and_IK()
 
@@ -845,6 +1039,44 @@ class RigidEntity(Entity):
             )
 
         return link, joints
+
+    @staticmethod
+    def _convert_g_infos_to_cg_infos_and_vg_infos(morph, g_infos, is_robot):
+        """
+        Separate collision from visual geometry and post-process collision meshes.
+        Used for both normal loading and heterogeneous simulation.
+        """
+        cg_infos, vg_infos = [], []
+        for g_info in g_infos:
+            is_col = g_info["contype"] or g_info["conaffinity"]
+            if morph.collision and is_col:
+                cg_infos.append(g_info)
+            if morph.visualization and not is_col:
+                vg_infos.append(g_info)
+
+        # Post-process all collision meshes at once
+        if isinstance(morph, gs.options.morphs.FileMorph):
+            if is_robot:
+                decompose_error_threshold = morph.decompose_robot_error_threshold
+            else:
+                decompose_error_threshold = morph.decompose_object_error_threshold
+
+            cg_infos = mu.postprocess_collision_geoms(
+                cg_infos,
+                morph.decimate,
+                morph.decimate_face_num,
+                morph.decimate_aggressiveness,
+                morph.convexify,
+                decompose_error_threshold,
+                morph.coacd_options,
+            )
+
+        # Randomize collision mesh colors
+        for g_info in cg_infos:
+            mesh = g_info["mesh"]
+            mesh.set_color((*np.random.rand(3), 0.7))
+
+        return cg_infos, vg_infos
 
     def _add_equality(self, name, type, objs_name, data, sol_params):
         objs_id = []
@@ -1418,13 +1650,13 @@ class RigidEntity(Entity):
             self._solver._static_rigid_sim_config,
         )
 
-        qpos = ti_to_torch(self._IK_qpos_best, transpose=True)
+        qpos = ti_to_torch(self._IK_qpos_best, transpose=True, copy=True)
         qpos = qpos[0] if self._solver.n_envs == 0 else qpos[envs_idx]
 
         if return_error:
-            error_pose = ti_to_torch(self._IK_err_pose_best, transpose=True).reshape((-1, self._IK_n_tgts, 6))[
-                :, :n_links
-            ]
+            error_pose = ti_to_torch(self._IK_err_pose_best, transpose=True, copy=True).reshape(
+                (-1, self._IK_n_tgts, 6)
+            )[:, :n_links]
             error_pose = error_pose[0] if self._solver.n_envs == 0 else error_pose[envs_idx]
             return qpos, error_pose
         return qpos
@@ -2036,15 +2268,65 @@ class RigidEntity(Entity):
         from genesis.engine.couplers import LegacyCoupler
 
         if self.n_geoms == 0:
-            gs.raise_exception("Entity has no geoms.")
+            gs.raise_exception("Entity has no collision geometries.")
 
         # Already computed internally by the solver. Let's access it directly for efficiency.
         if allow_fast_approx and isinstance(self.sim.coupler, LegacyCoupler):
             return self._solver.get_AABB(entities_idx=[self._idx_in_solver], envs_idx=envs_idx)[..., 0, :]
 
+        # For heterogeneous entities, compute AABB per-environment respecting active_envs_idx.
+        # FIXME: Remove this branch after implementing 'get_verts'.
+        if self._enable_heterogeneous and self._solver.n_envs > 0:
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            n_envs = len(envs_idx)
+            aabb_min = torch.full((n_envs, 3), float("inf"), dtype=gs.tc_float, device=gs.device)
+            aabb_max = torch.full((n_envs, 3), float("-inf"), dtype=gs.tc_float, device=gs.device)
+            for geom in self.geoms:
+                geom_aabb = geom.get_AABB()
+                active_mask = geom.active_envs_mask[envs_idx] if geom.active_envs_mask is not None else ()
+                aabb_min[active_mask] = torch.minimum(aabb_min[active_mask], geom_aabb[envs_idx[active_mask], 0])
+                aabb_max[active_mask] = torch.maximum(aabb_max[active_mask], geom_aabb[envs_idx[active_mask], 1])
+            return torch.stack((aabb_min, aabb_max), dim=-2)
+
         # Compute the AABB on-the-fly based on the positions of all the vertices
-        verts = self.get_verts()
-        return torch.stack((verts.min(axis=-2).values, verts.max(axis=-2).values), axis=-2)
+        verts = self.get_verts()[envs_idx if envs_idx is not None else ()]
+        return torch.stack((verts.min(dim=-2).values, verts.max(dim=-2).values), dim=-2)
+
+    @gs.assert_built
+    def get_vAABB(self, envs_idx=None):
+        """
+        Get the axis-aligned bounding box (AABB) of the entity in world frame by aggregating all the visual
+        geometries associated with this entity.
+
+        Parameters
+        ----------
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        aabb : torch.Tensor, shape (2, 3) or (n_envs, 2, 3)
+            The AABB of the entity, where `[:, 0] = min_corner (x_min, y_min, z_min)` and
+            `[:, 1] = max_corner (x_max, y_max, z_max)`.
+        """
+        if self.n_vgeoms == 0:
+            gs.raise_exception("Entity has no visual geometries.")
+
+        # For heterogeneous entities, compute AABB per-environment respecting active_envs_idx
+        if self._enable_heterogeneous:
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            n_envs = len(envs_idx)
+            aabb_min = torch.full((n_envs, 3), float("inf"), dtype=gs.tc_float, device=gs.device)
+            aabb_max = torch.full((n_envs, 3), float("-inf"), dtype=gs.tc_float, device=gs.device)
+            for vgeom in self.vgeoms:
+                vgeom_aabb = vgeom.get_vAABB(envs_idx)
+                active_mask = vgeom.active_envs_mask[envs_idx] if vgeom.active_envs_mask is not None else ()
+                aabb_min[active_mask] = torch.minimum(aabb_min[active_mask], vgeom_aabb[active_mask, 0])
+                aabb_max[active_mask] = torch.maximum(aabb_max[active_mask], vgeom_aabb[active_mask, 1])
+            return torch.stack((aabb_min, aabb_max), dim=-2)
+
+        aabbs = torch.stack([vgeom.get_vAABB(envs_idx) for vgeom in self._vgeoms], dim=-3)
+        return torch.stack((aabbs[..., 0, :].min(dim=-2).values, aabbs[..., 1, :].max(dim=-2).values), dim=-2)
 
     def get_aabb(self):
         raise DeprecationError("This method has been removed. Please use 'get_AABB()' instead.")
@@ -2224,36 +2506,22 @@ class RigidEntity(Entity):
         verts : torch.Tensor, shape (n_envs, n_verts, 3)
             The vertices of the entity.
         """
+        if self._enable_heterogeneous:
+            gs.raise_exception("This method is not supported for heterogeneous entities.")
+
         self._solver.update_verts_for_geoms(slice(self.geom_start, self.geom_end))
 
         n_fixed_verts, n_free_vertices = self._n_fixed_verts, self._n_free_verts
         tensor = torch.empty((self._solver._B, n_fixed_verts + n_free_vertices, 3), dtype=gs.tc_float, device=gs.device)
 
         if n_fixed_verts > 0:
-            if gs.use_zerocopy:
-                fixed_verts_state = ti_to_torch(self._solver.fixed_verts_state.pos)
-                tensor[:, self._fixed_verts_idx_local] = fixed_verts_state[
-                    self._fixed_verts_state_start : self._fixed_verts_state_start + n_fixed_verts
-                ]
-            else:
-                _kernel_get_fixed_verts(
-                    tensor, self._fixed_verts_idx_local, self._fixed_verts_state_start, self._solver.fixed_verts_state
-                )
+            verts_idx = slice(self._fixed_verts_state_start, self._fixed_verts_state_start + n_fixed_verts)
+            fixed_verts_state = ti_to_torch(self._solver.fixed_verts_state.pos, verts_idx)
+            tensor[:, self._fixed_verts_idx_local] = fixed_verts_state
         if n_free_vertices > 0:
-            if gs.use_zerocopy:
-                free_verts_state = ti_to_torch(self._solver.free_verts_state.pos, transpose=True)
-                tensor[:, self._free_verts_idx_local] = free_verts_state[
-                    :, self._free_verts_state_start : self._free_verts_state_start + n_free_vertices
-                ]
-            else:
-                # FIXME: Get around some bug in gstaichi when using gstaichi with metal backend
-                must_copy = gs.backend == gs.metal and n_fixed_verts > 0
-                tensor_free = torch.zeros_like(tensor) if must_copy else tensor
-                _kernel_get_free_verts(
-                    tensor_free, self._free_verts_idx_local, self._free_verts_state_start, self._solver.free_verts_state
-                )
-                if must_copy:
-                    tensor += tensor_free
+            verts_idx = slice(self._free_verts_state_start, self._free_verts_state_start + n_free_vertices)
+            free_verts_state = ti_to_torch(self._solver.free_verts_state.pos, None, verts_idx, transpose=True)
+            tensor[:, self._free_verts_idx_local] = free_verts_state
 
         if self._solver.n_envs == 0:
             tensor = tensor[0]
@@ -2795,7 +3063,7 @@ class RigidEntity(Entity):
         contact_info : dict
             The contact information.
         """
-        contacts_info = self._solver.collider.get_contacts(as_tensor=True, to_torch=True)
+        contact_data = self._solver.collider.get_contacts(as_tensor=True, to_torch=True)
 
         logical_operation = torch.logical_xor if exclude_self_contact else torch.logical_or
         if with_entity is not None and self.idx == with_entity.idx:
@@ -2805,12 +3073,12 @@ class RigidEntity(Entity):
 
         valid_mask = logical_operation(
             torch.logical_and(
-                contacts_info["geom_a"] >= self.geom_start,
-                contacts_info["geom_a"] < self.geom_end,
+                contact_data["geom_a"] >= self.geom_start,
+                contact_data["geom_a"] < self.geom_end,
             ),
             torch.logical_and(
-                contacts_info["geom_b"] >= self.geom_start,
-                contacts_info["geom_b"] < self.geom_end,
+                contact_data["geom_b"] >= self.geom_start,
+                contact_data["geom_b"] < self.geom_end,
             ),
         )
         if with_entity is not None and self.idx != with_entity.idx:
@@ -2818,26 +3086,26 @@ class RigidEntity(Entity):
                 valid_mask,
                 torch.logical_or(
                     torch.logical_and(
-                        contacts_info["geom_a"] >= with_entity.geom_start,
-                        contacts_info["geom_a"] < with_entity.geom_end,
+                        contact_data["geom_a"] >= with_entity.geom_start,
+                        contact_data["geom_a"] < with_entity.geom_end,
                     ),
                     torch.logical_and(
-                        contacts_info["geom_b"] >= with_entity.geom_start,
-                        contacts_info["geom_b"] < with_entity.geom_end,
+                        contact_data["geom_b"] >= with_entity.geom_start,
+                        contact_data["geom_b"] < with_entity.geom_end,
                     ),
                 ),
             )
 
         if self._solver.n_envs == 0:
-            contacts_info = {key: value[valid_mask] for key, value in contacts_info.items()}
+            contact_data = {key: value[valid_mask] for key, value in contact_data.items()}
         else:
-            contacts_info["valid_mask"] = valid_mask
+            contact_data["valid_mask"] = valid_mask
 
-        contacts_info["force_a"] = -contacts_info["force"]
-        contacts_info["force_b"] = +contacts_info["force"]
-        del contacts_info["force"]
+        contact_data["force_a"] = -contact_data["force"]
+        contact_data["force_b"] = +contact_data["force"]
+        del contact_data["force"]
 
-        return contacts_info
+        return contact_data
 
     def get_links_net_contact_force(self, envs_idx=None):
         """
@@ -2848,9 +3116,8 @@ class RigidEntity(Entity):
         entity_links_force : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
             The net force applied on each links due to direct external contacts.
         """
-        tensor = ti_to_torch(
-            self._solver.links_state.contact_force, envs_idx, slice(self.link_start, self.link_end), transpose=True
-        )
+        links_idx = slice(self.link_start, self.link_end)
+        tensor = ti_to_torch(self._solver.links_state.contact_force, envs_idx, links_idx, transpose=True, copy=True)
         return tensor[0] if self._solver.n_envs == 0 else tensor
 
     def set_friction_ratio(self, friction_ratio, links_idx_local=None, envs_idx=None):
@@ -2873,11 +3140,9 @@ class RigidEntity(Entity):
         )
         links_friction_ratio = torch.as_tensor(friction_ratio, dtype=gs.tc_float, device=gs.device)
         geoms_friction_ratio = torch.repeat_interleave(links_friction_ratio, links_n_geoms, dim=-1)
-        geoms_idx = torch.tensor(
-            [i_g for i_l in links_idx_local for i_g in range(self._links[i_l].geom_start, self._links[i_l].geom_end)],
-            dtype=gs.tc_int,
-            device=gs.device,
-        )
+        geoms_idx = [
+            i_g for i_l in links_idx_local for i_g in range(self._links[i_l].geom_start, self._links[i_l].geom_end)
+        ]
 
         self._solver.set_geoms_friction_ratio(geoms_friction_ratio, geoms_idx, envs_idx)
 
@@ -2970,19 +3235,38 @@ class RigidEntity(Entity):
         """
         Get the total mass of the entity in kg.
 
+        For heterogeneous entities, returns an array of masses for each environment.
+        For non-heterogeneous entities, returns a scalar mass.
+
         Returns
         -------
-        mass : float
-            The total mass of the entity in kg.
+        mass : float | np.ndarray
+            The total mass of the entity in kg. For heterogeneous entities, returns
+            an array of shape (n_envs,) with per-environment masses.
         """
-        mass = 0.0
-        for link in self.links:
-            mass += link.get_mass()
-        return mass
+        if self._enable_heterogeneous:
+            # Use solver's batched links_info for accurate per-environment masses
+            all_links_mass = self._solver.links_info.inertial_mass.to_numpy()
+            links_idx = np.arange(self.link_start, self.link_end)
+            # Shape: (n_links, n_envs) -> sum over links axis
+            return all_links_mass[links_idx].sum(axis=0)
+        else:
+            # Original behavior: sum link masses to scalar
+            mass = 0.0
+            for link in self.links:
+                mass += link.get_mass()
+            return mass
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
+
+    @property
+    def is_built(self):
+        """
+        Whether this rigid entity is built.
+        """
+        return self._is_built
 
     @property
     def visualize_contact(self):
@@ -3007,6 +3291,16 @@ class RigidEntity(Entity):
     def n_links(self):
         """The number of `RigidLink` in the entity."""
         return len(self._links)
+
+    @property
+    def main_morph(self):
+        """The main morph of the entity (first morph for heterogeneous entities)."""
+        return self._morph
+
+    @property
+    def morphs(self):
+        """All morphs of the entity (main morph + heterogeneous variants if any)."""
+        return (self._morph, *self._morph_heterogeneous)
 
     @property
     def n_joints(self):
@@ -3162,22 +3456,14 @@ class RigidEntity(Entity):
         """The list of collision geoms (`RigidGeom`) in the entity."""
         if self.is_built:
             return self._geoms
-        else:
-            geoms = gs.List()
-            for link in self._links:
-                geoms += link.geoms
-            return geoms
+        return gs.List(geom for link in self._links for geom in link.geoms)
 
     @property
     def vgeoms(self):
         """The list of visual geoms (`RigidVisGeom`) in the entity."""
         if self.is_built:
             return self._vgeoms
-        else:
-            vgeoms = gs.List()
-            for link in self._links:
-                vgeoms += link.vgeoms
-            return vgeoms
+        return gs.List(vgeom for link in self._links for vgeom in link.vgeoms)
 
     @property
     def links(self) -> list[RigidLink]:
