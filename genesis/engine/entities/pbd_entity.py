@@ -1,12 +1,10 @@
 import gstaichi as ti
 import numpy as np
-import torch
 import trimesh
 
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
-from genesis.engine.entities.base_entity import Entity
 from genesis.engine.entities.particle_entity import ParticleEntity
 
 
@@ -315,7 +313,7 @@ class PBD2DEntity(PBDTetEntity):
         )
 
         self._inner_edge_start = inner_edge_start
-        self._material_type = self.solver.MATERIAL.CLOTH
+        self._material_type = int(self.solver.MATERIAL.CLOTH)
 
     def sample(self):
         """Sample and preprocess the 2D mesh for the PBD cloth-like entity."""
@@ -452,7 +450,7 @@ class PBD3DEntity(PBDTetEntity):
 
         self._elem_start = elem_start
 
-        self._material_type = self.solver.MATERIAL.ELASTIC
+        self._material_type = int(self.solver.MATERIAL.ELASTIC)
 
     def sample(self):
         super().sample()
@@ -462,7 +460,7 @@ class PBD3DEntity(PBDTetEntity):
         self._mass = self._vmesh.volume * self.material.rho
 
         tet_cfg = mu.generate_tetgen_config_from_morph(self.morph)
-        particles, elems = self._mesh.tetrahedralize(tet_cfg)
+        particles, elems, *_ = self._mesh.tetrahedralize(tet_cfg)
         self._particles = particles.astype(gs.np_float, copy=False)
         self._init_particles_offset = gs.tensor(self._particles) - gs.tensor(self._morph.pos)
 
@@ -559,7 +557,7 @@ class PBDParticleEntity(PBDBaseEntity):
             f=self._sim.cur_substep_local,
             particles=self._particles,
             rho=self._material.rho,
-            material_type=self.solver.MATERIAL.LIQUID,
+            material_type=int(self.solver.MATERIAL.LIQUID),
             active=self.active,
         )
 
@@ -635,7 +633,7 @@ class PBDFreeParticleEntity(PBDBaseEntity):
             f=self._sim.cur_substep_local,
             particles=self._particles,
             rho=self._material.rho,
-            material_type=self.solver.MATERIAL.PARTICLE,
+            material_type=int(self.solver.MATERIAL.PARTICLE),
             active=self.active,
         )
 

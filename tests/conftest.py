@@ -5,11 +5,13 @@ import logging
 import os
 import re
 import subprocess
+from argparse import SUPPRESS
 import sys
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
 
+import setproctitle
 import psutil
 import pyglet
 import pytest
@@ -56,6 +58,15 @@ IMG_STD_ERR_THR = 1.0
 IMG_NUM_ERR_THR = 0.001
 
 
+def is_mem_monitoring_supported():
+    try:
+        assert sys.platform.startswith("linux")
+        subprocess.check_output(["nvidia-smi"], stderr=subprocess.STDOUT, timeout=10)
+        return True, None
+    except Exception as exc:  # platform or nvidia-smi unavailable
+        return False, exc
+
+
 def pytest_make_parametrize_id(config, val, argname):
     if isinstance(val, Enum):
         return val.name
@@ -64,7 +75,7 @@ def pytest_make_parametrize_id(config, val, argname):
     return f"{val}"
 
 
-@pytest.hookimpl
+@pytest.hookimpl(tryfirst=True)
 def pytest_cmdline_main(config: pytest.Config) -> None:
     # Make sure that no unsupported markers have been specified in CLI
     declared_markers = set(name for spec in config.getini("markers") if (name := spec.split(":")[0]) != "forked")
@@ -72,6 +83,22 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
         eval(config.option.markexpr, {"__builtins__": {}}, {key: None for key in declared_markers})
     except NameError as e:
         raise pytest.UsageError(f"Unknown marker in CLI expression: '{e.name}'")
+
+    # Only launch memory monitor from the main process, not from xdist workers
+    mem_filepath = config.getoption("--mem-monitoring-filepath")
+    if mem_filepath and not os.environ.get("PYTEST_XDIST_WORKER"):
+        supported, reason = is_mem_monitoring_supported()
+        if not supported:
+            raise pytest.UsageError(f"--mem-monitoring-filepath is not supported on this platform: {reason}")
+        subprocess.Popen(
+            [
+                sys.executable,
+                "tests/monitor_test_mem.py",
+                "--die-with-parent",
+                "--out-file",
+                mem_filepath,
+            ]
+        )
 
     # Make sure that benchmarks are running on GPU and the number of workers if valid
     expr = Expression.compile(config.option.markexpr)
@@ -255,7 +282,9 @@ def pytest_xdist_auto_num_workers(config):
                     check=True,
                     text=True,
                 )
-                devices_vram_memory = tuple(int(m.group(1)) for m in re.finditer(r"VRAM Total:\s+(\d+)\s*MiB", out))
+                devices_vram_memory = tuple(
+                    int(m.group(1)) for m in re.finditer(r"VRAM Total:\s+(\d+)\s*MiB", result.stdout)
+                )
             except (FileNotFoundError, subprocess.CalledProcessError):
                 pass
         if devices_vram_memory is not None:
@@ -328,7 +357,15 @@ def pytest_collection_modifyitems(config, items):
     items[:] = [item for bucket in sorted(buckets, key=len) for item in bucket]
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
+    # Include test name in process title
+    test_name = item.nodeid.replace(" ", "")
+    dtype = "ndarray" if os.environ.get("GS_ENABLE_NDARRAY") == "1" else "field"
+    test_name = test_name[:-1] + f"-{dtype}]"
+
+    setproctitle.setproctitle(f"pytest: {test_name}")
+
     # Match CUDA device with EGL device.
     # Note that this must be done here instead of 'pytest_cmdline_main', otherwise it will segfault when using
     # 'pytest-forked', because EGL instances are not allowed to cross thread boundaries.
@@ -348,6 +385,13 @@ def pytest_addoption(parser):
     )
     parser.addoption("--vis", action="store_true", default=False, help="Enable interactive viewer.")
     parser.addoption("--dev", action="store_true", default=False, help="Enable genesis debug mode.")
+    supported, _reason = is_mem_monitoring_supported()
+    help_text = (
+        "Run memory monitoring, and store results to mem_monitoring_filepath. CUDA on linux ONLY."
+        if supported
+        else SUPPRESS
+    )
+    parser.addoption("--mem-monitoring-filepath", type=str, help=help_text)
 
 
 @pytest.fixture(scope="session")
@@ -357,12 +401,7 @@ def show_viewer(pytestconfig):
 
 @pytest.fixture(scope="session")
 def backend(pytestconfig):
-    import genesis as gs
-
-    backend = pytestconfig.getoption("--backend") or gs.cpu
-    if isinstance(backend, str):
-        return getattr(gs.constants.backend, backend)
-    return backend
+    return pytestconfig.getoption("--backend") or "cpu"
 
 
 @pytest.fixture(scope="session")
@@ -519,6 +558,10 @@ def initialize_genesis(
         yield
         return
 
+    # Convert backend from string to enum if necessary
+    if isinstance(backend, str):
+        backend = getattr(gs.constants.backend, backend)
+
     logging_level = request.config.getoption("--log-cli-level", logging.INFO)
     if debug is None:
         debug = request.config.getoption("--dev")
@@ -656,7 +699,7 @@ def box_obj_path(asset_tmp_path, cube_verts_and_faces):
     """Fixture that generates a temporary cube .obj file"""
     verts, faces = cube_verts_and_faces
 
-    filename = str(asset_tmp_path / f"fixture_box_obj_path.obj")
+    filename = str(asset_tmp_path / "fixture_box_obj_path.obj")
     with open(filename, "w", encoding="utf-8") as f:
         for x, y, z in verts:
             f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
@@ -704,8 +747,8 @@ def png_snapshot(request, snapshot):
     snapshot_dir = Path(PixelMatchSnapshotExtension.dirname(test_location=snapshot_obj.test_location))
     snapshot_name = PixelMatchSnapshotExtension.get_snapshot_name(test_location=snapshot_obj.test_location)
 
-    must_update_snapshop = request.config.getoption("--snapshot-update")
-    if must_update_snapshop:
+    must_update_snapshot = request.config.getoption("--snapshot-update")
+    if must_update_snapshot:
         for path in (Path(snapshot_dir.parent) / snapshot_dir.name).glob(f"{snapshot_name}*"):
             assert path.is_file()
             path.unlink()

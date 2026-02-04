@@ -1,9 +1,10 @@
+import collections.abc
 import os
 import pickle
 import sys
 import time
 import weakref
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable, Literal
 
 import numpy as np
 import torch
@@ -33,7 +34,6 @@ from genesis.options import (
 from genesis.options.morphs import Morph
 from genesis.options.surfaces import Surface
 from genesis.options.renderers import Rasterizer, RendererOptions
-from genesis.options.sensors import SensorOptions
 from genesis.options.recorders import RecorderOptions
 from genesis.recorders import RecorderManager
 from genesis.repr_base import RBC
@@ -45,6 +45,7 @@ from genesis.utils.warnings import warn_once
 if TYPE_CHECKING:
     from genesis.engine.entities.base_entity import Entity
     from genesis.recorders import Recorder
+    from genesis.options.sensors import SensorOptions
 
 
 @gs.assert_initialized
@@ -302,6 +303,10 @@ class Scene(RBC):
             self._visualizer.destroy()
             self._visualizer = None
 
+        if getattr(self, "_sim", None) is not None:
+            self._sim.destroy()
+            self._sim = None
+
         # Stop tracking this scene
         try:
             gs._scene_registry.remove(weakref.ref(self))
@@ -312,7 +317,7 @@ class Scene(RBC):
     @gs.assert_unbuilt
     def add_entity(
         self,
-        morph: Morph,
+        morph: Morph | Iterable[Morph],
         material: Material | None = None,
         surface: Surface | None = None,
         visualize_contact: bool = False,
@@ -323,16 +328,20 @@ class Scene(RBC):
 
         Parameters
         ----------
-        morph : gs.morphs.Morph
-            The morph of the entity.
+        morph : gs.morphs.Morph | list[gs.morphs.Morph]
+            The morph of the entity. If a list of morphs is provided, the entity will be heterogeneous
+            (rigid only, single-link entities only). Each parallel environment will simulate a different
+            geometry variant from the list.
         material : gs.materials.Material | None, optional
             The material of the entity. If None, use ``gs.materials.Rigid()``.
         surface : gs.surfaces.Surface | None, optional
             The surface of the entity. If None, use ``gs.surfaces.Default()``.
         visualize_contact : bool
-            Whether to visualize contact forces applied to this entity as arrows in the viewer and rendered images. Note that this will not be displayed in images rendered by camera using the `RayTracer` renderer.
+            Whether to visualize contact forces applied to this entity as arrows in the viewer and rendered images.
+            Note that this will not be displayed in images rendered by camera using the `RayTracer` renderer.
         vis_mode : str | None, optional
-            The visualization mode of the entity. This is a handy shortcut for setting `surface.vis_mode` without explicitly creating a surface object.
+            The visualization mode of the entity. This is a handy shortcut for setting `surface.vis_mode` without
+            explicitly creating a surface object.
 
         Returns
         -------
@@ -346,24 +355,36 @@ class Scene(RBC):
             # assign a local surface, otherwise modification will apply on global default surface
             surface = gs.surfaces.Default()
 
+        # Handle heterogeneous morphs (any iterable of morphs, excluding Morph objects)
+        is_heterogeneous = isinstance(morph, collections.abc.Iterable) and not isinstance(morph, Morph)
+        if is_heterogeneous:
+            morph = tuple(morph)
+            morph_for_checks = morph[0]
+            if not isinstance(material, gs.materials.Rigid):
+                gs.raise_exception("Heterogeneous morphs (iterable of morphs) are only supported for Rigid materials.")
+            for m in morph:
+                if not isinstance(m, (gs.morphs.Primitive, gs.morphs.Mesh)):
+                    gs.raise_exception(
+                        f"Heterogeneous morphs only support Primitive and Mesh types, got: {type(m).__name__}."
+                    )
+        else:
+            morph_for_checks = morph
+
         if isinstance(material, gs.materials.Rigid):
             # small sdf res is sufficient for primitives regardless of size
-            if isinstance(morph, gs.morphs.Primitive):
+            if isinstance(morph_for_checks, gs.morphs.Primitive):
                 material._sdf_max_res = 32
 
         # some morph should not smooth surface normal
-        if isinstance(morph, (gs.morphs.Box, gs.morphs.Cylinder, gs.morphs.Terrain)):
+        if isinstance(morph_for_checks, (gs.morphs.Box, gs.morphs.Cylinder, gs.morphs.Terrain)):
             surface.smooth = False
 
-        if isinstance(morph, (gs.morphs.URDF, gs.morphs.MJCF, gs.morphs.Terrain)):
+        if isinstance(morph_for_checks, (gs.morphs.URDF, gs.morphs.MJCF, gs.morphs.USD, gs.morphs.Terrain)):
             if not isinstance(material, (gs.materials.Rigid, gs.materials.Hybrid)):
-                gs.raise_exception(f"Unsupported material for morph: {material} and {morph}.")
+                gs.raise_exception(f"Unsupported material for morph: {material} and {morph_for_checks}.")
 
         if surface.double_sided is None:
-            if isinstance(material, gs.materials.PBD.Cloth):
-                surface.double_sided = True
-            else:
-                surface.double_sided = False
+            surface.double_sided = isinstance(material, gs.materials.PBD.Cloth)
 
         if vis_mode is not None:
             surface.vis_mode = vis_mode
@@ -374,7 +395,8 @@ class Scene(RBC):
 
             if surface.vis_mode not in ("visual", "collision", "sdf"):
                 gs.raise_exception(
-                    f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'collision', 'sdf']."
+                    f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: "
+                    "['visual', 'collision', 'sdf']."
                 )
 
         elif isinstance(
@@ -444,6 +466,53 @@ class Scene(RBC):
         entity = self._sim._add_entity(morph, material, surface, visualize_contact)
 
         return entity
+
+    @gs.assert_unbuilt
+    def add_stage(
+        self,
+        morph: gs.morphs.USD,
+        material: Material | None = None,
+        surface: Surface | None = None,
+        visualize_contact: bool = False,
+        vis_mode: Literal["visual", "collision"] = "visual",
+    ):
+        """
+        Add a stage to the scene.
+
+        Parameters
+        ----------
+        morph : gs.morphs.USD
+            The stage to add to the scene.
+        material : gs.materials.Material | None, optional
+            The material of the stage. If None, use ``gs.materials.Rigid()`` for all morphs.
+        surface : gs.surfaces.Surface | None, optional
+            The surface of the stage. If None, use ``gs.surfaces.Default()`` for all morphs.
+        visualize_contact : bool
+            Whether to visualize contact forces applied to this stage as arrows in the viewer and rendered images.
+            Note that this will not be displayed in images rendered by camera using the `RayTracer` renderer.
+        vis_mode : str | None, optional
+            The visualization mode of the stage. This is a handy shortcut for setting `surface.vis_mode` without
+            explicitly creating a surface object.
+
+        Returns
+        -------
+        entities : List[genesis.Entity]
+            The created entities.
+        """
+        entity_morphs = []
+        if isinstance(morph, gs.morphs.USD):
+            from genesis.utils.usd import parse_usd_stage
+
+            # Return a list of `gs.morphs.USD` for each parsed rigid entity in the stage.
+            entity_morphs = parse_usd_stage(morph)
+        else:
+            gs.raise_exception(f"Unsupported morph: {morph}.")
+
+        entities = []
+        for entity_morph in entity_morphs:
+            entities.append(self.add_entity(entity_morph, material, surface, visualize_contact, vis_mode))
+
+        return entities
 
     @gs.assert_unbuilt
     def add_mesh_light(

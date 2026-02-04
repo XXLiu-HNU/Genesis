@@ -12,6 +12,7 @@ from genesis.utils.geom import euler_to_quat
 from genesis.utils.misc import concat_with_tensor, make_tensor_field, broadcast_tensor
 
 if TYPE_CHECKING:
+    from genesis.options.sensors.options import SensorOptions
     from genesis.engine.entities.rigid_entity.rigid_link import RigidLink
     from genesis.engine.solvers import RigidSolver
     from genesis.recorders.base_recorder import Recorder, RecorderOptions
@@ -47,7 +48,21 @@ class SharedSensorMetadata:
     """
 
     cache_sizes: list[int] = field(default_factory=list)
-    delays_ts: torch.Tensor = make_tensor_field((0, 0), dtype_factory=lambda: gs.tc_int)
+    delays_ts: torch.Tensor = make_tensor_field((0, 0), dtype=gs.tc_int)
+
+    def __del__(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def destroy(self):
+        """
+        Destroy shared metadata.
+
+        This method is called by SensorManager when the scene is destroyed. his should remove any references to the
+        sensors from the shared metadata, and clean up any resources associated with the sensors.
+        """
 
 
 SharedSensorMetadataT = TypeVar("SharedSensorMetadataT", bound=SharedSensorMetadata)
@@ -247,6 +262,7 @@ class Sensor(RBC, Generic[SharedSensorMetadataT]):
             interpolate = [False for _ in shared_metadata.cache_sizes]
 
         tensor_start = 0
+        envs_idx = shared_metadata.solver.scene._envs_idx
         for sensor_idx, (tensor_size, interp) in enumerate(zip(shared_metadata.cache_sizes, interpolate)):
             # Compute the current delay of the sensor, taking into account jitter if any
             cur_delay_ts = shared_metadata.delays_ts[:, sensor_idx]
@@ -257,7 +273,6 @@ class Sensor(RBC, Generic[SharedSensorMetadataT]):
             cur_delay_ts_int = cur_delay_ts.to(dtype=torch.int64)
 
             # Update shared cached with left data (Zero Order Hold) or linearly interpolated data (First Order)
-            envs_idx = torch.arange(len(cur_delay_ts), device=gs.device)
             tensor_slice = slice(tensor_start, tensor_start + tensor_size)
             sensor_cache = shared_cache[:, tensor_slice]
             data_left = buffered_data.at(cur_delay_ts_int, envs_idx, tensor_slice)
@@ -314,7 +329,7 @@ class RigidSensorMetadataMixin:
     """
 
     solver: "RigidSolver | None" = None
-    links_idx: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
+    links_idx: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
     offsets_pos: torch.Tensor = make_tensor_field((0, 0, 3))
     offsets_quat: torch.Tensor = make_tensor_field((0, 0, 4))
 

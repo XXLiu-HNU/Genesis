@@ -1,5 +1,6 @@
 import math
 import dataclasses
+from enum import IntEnum
 from functools import partial
 from typing_extensions import dataclass_transform  # Made it into standard lib from Python 3.12
 
@@ -71,6 +72,18 @@ def V_SCALAR_FROM(dtype, value):
     data = V(dtype=dtype, shape=())
     data.fill(value)
     return data
+
+
+# =========================================== ErrorCode ===========================================
+
+
+class ErrorCode(IntEnum):
+    SUCCESS = 0b000000000000000000000000000000000
+    OVERFLOW_CANDIDATE_CONTACTS = 0b00000000000000000000000000000001
+    OVERFLOW_COLLISION_PAIRS = 0b00000000000000000000000000000010
+    OVERFLOW_HIBERNATION_ISLANDS = 0b00000000000000000000000000000100
+    INVALID_FORCE_NAN = 0b00000000000000000000000000001000
+    INVALID_ACC_NAN = 0b00000000000000000000000000010000
 
 
 # =========================================== RigidGlobalInfo ===========================================
@@ -216,6 +229,11 @@ class StructConstraintState(metaclass=BASE_METACLASS):
     cg_beta: V_ANNOTATION
     cg_pg_dot_pMg: V_ANNOTATION
     # Optional Newton fields
+    # Hessian matrix of the optimization problem as a dense 2D tensor.
+    # Note that only the lower triangular part is updated for efficiency because this matrix is symmetric by definition.
+    # As a result, the values of the strictly upper triangular part is undefined.
+    # In practice, this variable is re-purposed to store the Cholesky factor L st H = L @ L.T to spare memory resources.
+    # TODO: Optimize storage to only allocate memory half of the Hessian matrix to sparse memory resources.
     nt_H: V_ANNOTATION
     nt_vec: V_ANNOTATION
     # Backward gradients
@@ -476,9 +494,15 @@ def get_contact_island_state(solver, collider):
     max_contact_pairs = max(collider._collider_info.max_contact_pairs[None], 1)
     n_entities = max(solver.n_entities, 1)
 
+    # When hibernation is enabled, the island construction adds edges for hibernated entity chains
+    # in addition to contact edges. The chain construction is cyclic (last entity links back to first),
+    # so worst case: each entity contributes one hibernation edge, totaling n_entities hibernation edges.
+    max_hibernation_edges = n_entities if solver._use_hibernation else 0
+    max_edges = max_contact_pairs + max_hibernation_edges
+
     return StructContactIslandState(
-        ci_edges=V(dtype=gs.ti_int, shape=(max_contact_pairs, 2, _B)),
-        edge_id=V(dtype=gs.ti_int, shape=(max_contact_pairs * 2, _B)),
+        ci_edges=V(dtype=gs.ti_int, shape=(max_edges, 2, _B)),
+        edge_id=V(dtype=gs.ti_int, shape=(max_edges * 2, _B)),
         constraint_list=V(dtype=gs.ti_int, shape=(max_contact_pairs, _B)),
         constraint_id=V(dtype=gs.ti_int, shape=(max_contact_pairs * 2, _B)),
         entity_edge=get_agg_list(solver),
@@ -1357,6 +1381,11 @@ class StructLinksInfo(metaclass=BASE_METACLASS):
     inertial_i: V_ANNOTATION
     inertial_mass: V_ANNOTATION
     entity_idx: V_ANNOTATION
+    # Heterogeneous simulation support: per-link geom/vgeom index ranges
+    geom_start: V_ANNOTATION
+    geom_end: V_ANNOTATION
+    vgeom_start: V_ANNOTATION
+    vgeom_end: V_ANNOTATION
 
 
 def get_links_info(solver):
@@ -1381,6 +1410,11 @@ def get_links_info(solver):
         inertial_i=V(dtype=gs.ti_mat3, shape=links_info_shape),
         inertial_mass=V(dtype=gs.ti_float, shape=links_info_shape),
         entity_idx=V(dtype=gs.ti_int, shape=links_info_shape),
+        # Heterogeneous simulation support: per-link geom/vgeom index ranges
+        geom_start=V(dtype=gs.ti_int, shape=links_info_shape),
+        geom_end=V(dtype=gs.ti_int, shape=links_info_shape),
+        vgeom_start=V(dtype=gs.ti_int, shape=links_info_shape),
+        vgeom_end=V(dtype=gs.ti_int, shape=links_info_shape),
     )
 
 
@@ -1785,7 +1819,7 @@ class StructRigidAdjointCache(metaclass=BASE_METACLASS):
     # us not to overwrite the values that have been read during the forward pass, so we need to store the intemediate
     # values in this cache to avoid overwriting them. Specifically, after we compute next frame's qpos, dofs_vel, and
     # dofs_acc, we need to store them in this cache because we overwrite the values in the next frame. See how
-    # [kernel_save_adjoint_cache] is used in [rigid_solver_decomp.py] to store the values in this cache.
+    # [kernel_save_adjoint_cache] is used in [rigid_solver.py] to store the values in this cache.
     qpos: V_ANNOTATION
     dofs_vel: V_ANNOTATION
     dofs_acc: V_ANNOTATION
@@ -1814,6 +1848,7 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     batch_links_info: bool
     batch_dofs_info: bool
     batch_joints_info: bool
+    enable_heterogeneous: bool
     enable_mujoco_compatibility: bool
     enable_multi_contact: bool
     enable_joint_limit: bool
@@ -1881,7 +1916,7 @@ class DataManager:
             self.geoms_state_adjoint_cache = get_geoms_state(solver)
 
         self.rigid_adjoint_cache = get_rigid_adjoint_cache(solver)
-        self.errno = V_SCALAR_FROM(dtype=gs.ti_int, value=0)
+        self.errno = V(dtype=gs.ti_int, shape=(solver._B,))
 
 
 DofsState = StructDofsState if gs.use_ndarray else ti.template()

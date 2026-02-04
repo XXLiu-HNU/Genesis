@@ -206,6 +206,9 @@ class Simulator(RBC):
 
         self._sensor_manager.build()
 
+    def destroy(self):
+        self._sensor_manager.destroy()
+
     def reset(self, state: SimState, envs_idx=None):
         for solver, solver_state in zip(self._solvers, state):
             if solver.n_entities > 0:
@@ -283,7 +286,6 @@ class Simulator(RBC):
 
     def _step_grad(self):
         for _ in range(self._substeps - 1, -1, -1):
-
             if self.cur_substep_local == 0:
                 self.load_ckpt()
             self._cur_substep_global -= 1

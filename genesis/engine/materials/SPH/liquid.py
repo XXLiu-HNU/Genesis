@@ -1,7 +1,5 @@
 import gstaichi as ti
 
-import genesis as gs
-
 from .base import Base
 
 
@@ -23,8 +21,11 @@ class Liquid(Base):
     gamma: float, optional
         The surface tension of the liquid. Controls how strongly the material "clumps" together at boundaries. Default is 0.01
     sampler: str, optional
-        Particle sampler ('pbs', 'regular', 'random'). Note that 'pbs' is only supported on Linux for now. Defaults to
-        'pbs' on supported platforms, 'random' otherwise.
+        Particle sampler ('pbs', 'regular', 'random'). Note that 'pbs' is only supported on Linux x86 for now. Defaults to 'regular' because:
+        SPH is sensitive to the initial particle distribution, as it directly determines the initial density and pressure fields.
+        To ensure numerical stability, particles must be initialized using a regular sampler that enforces near-uniform spacing.
+        Irregular samplers (e.g. pbs, random) introduce local density fluctuations at initialization,
+        which lead to large spurious pressure forces and can cause the simulation to become unstable or diverge.
     """
 
     def __init__(
@@ -34,11 +35,8 @@ class Liquid(Base):
         exponent=7.0,
         mu=0.005,
         gamma=0.01,
-        sampler=None,
+        sampler="regular",
     ):
-        if sampler is None:
-            sampler = "pbs" if gs.platform == "Linux" else "random"
-
         super().__init__(sampler)
 
         self._rho = rho

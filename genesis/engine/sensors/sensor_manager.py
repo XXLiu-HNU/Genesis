@@ -74,6 +74,13 @@ class SensorManager:
                 sensor.build()
                 sensor._is_built = True
 
+    def destroy(self):
+        for sensors_metadata in self._sensors_metadata.values():
+            if sensors_metadata is not None:
+                sensors_metadata.destroy()
+        self._sensors_metadata.clear()
+        self._sensors_by_type.clear()
+
     def reset(self, envs_idx=None):
         envs_idx = self._sim._scene._sanitize_envs_idx(envs_idx)
 
@@ -90,6 +97,9 @@ class SensorManager:
             sensor_cls.reset(self._sensors_metadata[sensor_cls], envs_idx)
 
     def step(self):
+        for buffered_data in self._buffered_data.values():
+            buffered_data.rotate()
+
         for sensor_cls in self._sensors_by_type.keys():
             dtype = sensor_cls._get_cache_dtype()
             cache_slice = self._cache_slices_by_type[sensor_cls]

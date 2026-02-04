@@ -219,7 +219,7 @@ def kernel_cast_rays(
                 if node.left == -1:  # is leaf node
                     # A leaf node corresponds to one of the sorted triangles. Find the original triangle index.
                     sorted_leaf_idx = node_idx - (n_triangles - 1)
-                    i_f = ti.cast(bvh_morton_codes[0, sorted_leaf_idx][1], ti.i32)
+                    i_f = ti.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], ti.i32)
 
                     tri_vertices = ti.Matrix.zero(gs.ti_float, 3, 3)
                     for i in ti.static(range(3)):
@@ -293,7 +293,7 @@ class RaycasterSharedMetadata(RigidSensorMetadataMixin, SharedSensorMetadata):
     min_ranges: torch.Tensor = make_tensor_field((0,))
     max_ranges: torch.Tensor = make_tensor_field((0,))
     no_hit_values: torch.Tensor = make_tensor_field((0,))
-    return_world_frame: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_bool)
+    return_world_frame: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_bool)
 
     patterns: list[RaycastPattern] = field(default_factory=list)
     ray_dirs: torch.Tensor = make_tensor_field((0, 3))
@@ -301,11 +301,10 @@ class RaycasterSharedMetadata(RigidSensorMetadataMixin, SharedSensorMetadata):
     ray_starts_world: torch.Tensor = make_tensor_field((0, 3))
     ray_dirs_world: torch.Tensor = make_tensor_field((0, 3))
 
-    points_to_sensor_idx: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
-    sensor_cache_offsets: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
-    sensor_point_offsets: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
-    sensor_point_counts: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
-    output_hits: torch.Tensor = make_tensor_field((0, 0))  # FIXME: remove once we have contiguous cache slices
+    points_to_sensor_idx: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
+    sensor_cache_offsets: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
+    sensor_point_offsets: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
+    sensor_point_counts: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
 
 
 class RaycasterData(NamedTuple):
@@ -316,7 +315,6 @@ class RaycasterData(NamedTuple):
 @register_sensor(RaycasterOptions, RaycasterSharedMetadata, RaycasterData)
 @ti.data_oriented
 class RaycasterSensor(RigidSensorMixin, Sensor):
-
     def __init__(
         self,
         options: RaycasterOptions,
@@ -331,7 +329,7 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
     @classmethod
     def _update_bvh(cls, shared_metadata: RaycasterSharedMetadata):
         """Rebuild BVH from current geometry in the scene."""
-        from genesis.engine.solvers.rigid.rigid_solver_decomp import kernel_update_all_verts
+        from genesis.engine.solvers.rigid.rigid_solver import kernel_update_all_verts
 
         kernel_update_all_verts(
             geoms_info=shared_metadata.solver.geoms_info,
@@ -356,9 +354,6 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
 
         # first lidar sensor initialization: build aabb and bvh
         if self._shared_metadata.bvh is None:
-            self._shared_metadata.output_hits = torch.empty(
-                (self._manager._sim._B, 0), device=gs.device, dtype=gs.tc_float
-            )
             self._shared_metadata.sensor_cache_offsets = concat_with_tensor(
                 self._shared_metadata.sensor_cache_offsets, 0
             )
@@ -389,13 +384,8 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
         self._shared_metadata.sensors_ray_start_idx.append(self._shared_metadata.total_n_rays)
 
         # These fields are used to properly index into the big cache tensor in kernel_cast_rays
-        self._shared_metadata.output_hits = concat_with_tensor(
-            self._shared_metadata.output_hits,
-            torch.empty((self._manager._sim._B, self._cache_size), device=gs.device, dtype=gs.tc_float),
-            dim=-1,
-        )
         self._shared_metadata.sensor_cache_offsets = concat_with_tensor(
-            self._shared_metadata.sensor_cache_offsets, self._cache_size
+            self._shared_metadata.sensor_cache_offsets, self._cache_size * (self._idx + 1)
         )
         self._shared_metadata.sensor_point_offsets = concat_with_tensor(
             self._shared_metadata.sensor_point_offsets, self._shared_metadata.total_n_rays
@@ -441,6 +431,7 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
             links_pos = links_pos[None]
             links_quat = links_quat[None]
 
+        output_hits = shared_ground_truth_cache.contiguous()
         kernel_cast_rays(
             fixed_verts_state=shared_metadata.solver.fixed_verts_state,
             free_verts_state=shared_metadata.solver.free_verts_state,
@@ -459,12 +450,10 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
             sensor_cache_offsets=shared_metadata.sensor_cache_offsets,
             sensor_point_offsets=shared_metadata.sensor_point_offsets,
             sensor_point_counts=shared_metadata.sensor_point_counts,
-            output_hits=(
-                shared_ground_truth_cache if shared_ground_truth_cache.is_contiguous() else shared_metadata.output_hits
-            ),
+            output_hits=output_hits,
         )
         if not shared_ground_truth_cache.is_contiguous():
-            shared_ground_truth_cache[:] = shared_metadata.output_hits
+            shared_ground_truth_cache.copy_(output_hits)
 
     @classmethod
     def _update_shared_cache(
@@ -474,7 +463,7 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
         shared_cache: torch.Tensor,
         buffered_data: "TensorRingBuffer",
     ):
-        buffered_data.append(shared_ground_truth_cache)
+        buffered_data.set(shared_ground_truth_cache)
         cls._apply_delay_to_shared_cache(shared_metadata, shared_cache, buffered_data)
 
     def _draw_debug(self, context: "RasterizerContext", buffer_updates: dict[str, np.ndarray]):

@@ -1,10 +1,8 @@
 import os
 import xml.etree.ElementTree as ET
-import contextlib
 from pathlib import Path
 from itertools import chain
 from bisect import bisect_right
-import io
 
 import numpy as np
 import trimesh
@@ -25,26 +23,32 @@ MIN_TIMECONST = np.finfo(np.double).eps
 
 
 def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=False, links_to_keep=()):
-    if isinstance(xml, (str, Path)):
-        # Make sure that it is pointing to a valid XML content (either file path or string)
-        path = os.path.join(get_assets_dir(), xml)
-        is_valid_path = False
-        try:
-            if os.path.exists(path):
-                xml = ET.parse(path)
-                is_valid_path = True
-            else:
-                xml = ET.fromstring(xml)
-        except ET.ParseError:
-            gs.raise_exception_from(f"'{xml}' is not a valid XML file path or string.")
+    if isinstance(xml, (str, Path, urdfpy.URDF)):
+        if isinstance(xml, urdfpy.URDF):
+            is_urdf_file = True
+            asset_path = get_assets_dir()
+            root = xml._unparse(asset_path)
+            mjcf = ET.SubElement(root, "mujoco")
+        else:
+            # Make sure that it is pointing to a valid XML content (either file path or string)
+            path = os.path.join(get_assets_dir(), xml)
+            is_valid_path = False
+            try:
+                if os.path.exists(path):
+                    xml = ET.parse(path)
+                    is_valid_path = True
+                else:
+                    xml = ET.fromstring(xml)
+            except ET.ParseError:
+                gs.raise_exception_from(f"'{xml}' is not a valid XML file path or string.")
 
-        # Best guess for the search path
-        asset_path = os.path.dirname(path) if is_valid_path else os.getcwd()
+            # Best guess for the search path
+            asset_path = os.path.dirname(path) if is_valid_path else os.getcwd()
 
-        # Detect whether it is a URDF file or a Mujoco MJCF file
-        root = xml.getroot()
-        is_urdf_file = root.tag == "robot"
-        mjcf = ET.SubElement(root, "mujoco") if is_urdf_file else root
+            # Detect whether it is a URDF file or a Mujoco MJCF file
+            root = xml.getroot()
+            is_urdf_file = root.tag == "robot"
+            mjcf = ET.SubElement(root, "mujoco") if is_urdf_file else root
 
         # Parse all included sub-models recursively
         root_parent_stack = [(mjcf, Path(""))]
@@ -324,7 +328,7 @@ def parse_link(mj, i_l, scale):
 
         if i_a >= 0:
             if mj.actuator_dyntype[i_a] != mujoco.mjtDyn.mjDYN_NONE:
-                gs.logger.warning(f"(MJCF) Actuator internal dynamics not supported")
+                gs.logger.warning("(MJCF) Actuator internal dynamics not supported")
             gaintype = mujoco.mjtGain(mj.actuator_gaintype[i_a])
             if gaintype != mujoco.mjtGain.mjGAIN_FIXED:
                 gs.logger.warning(f"(MJCF) Actuator control gain of type '{gaintype}' not supported")
@@ -409,27 +413,54 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
 
     geom_size = mj_geom.size
     is_col = mj_geom.contype or mj_geom.conaffinity
-
-    visual = None
     metadata = {}
+
+    # Store geom name in metadata
+    name_start = mj.name_geomadr[i_g]
+    metadata["name"] = mj.names[name_start : mj.names.find(b"\x00", name_start)].decode("utf-8")
+
+    mj_mat_id = int(mj_geom.matid[0])
+    if mj_mat_id >= 0:
+        mj_mat = mj.mat(mj_mat_id)
+        tex_id_RGB = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGB]
+        tex_id_RGBA = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGBA]
+        tex_id = tex_id_RGB if tex_id_RGB >= 0 else tex_id_RGBA
+        if tex_id >= 0:
+            mj_tex = mj.tex(tex_id)
+            H, W, C = mj_tex.height[0], mj_tex.width[0], mj_tex.nchannel[0]
+            mj_mat_img = mj.tex_data[mj_tex.adr[0] : (mj_tex.adr[0] + H * W * C)].reshape(H, W, C)
+            mj_mat_img = Image.fromarray(mj_mat_img)
+        else:
+            mj_mat_img = None
+        mj_rgba = np.asarray(mj_mat.rgba, dtype=np.float32)
+        mj_specular = np.full(3, float(mj_mat.specular), dtype=np.float32)
+        mj_glossiness = float(mj_mat.shininess) * 128.0
+        tmesh_mat = trimesh.visual.material.SimpleMaterial(
+            image=mj_mat_img,
+            diffuse=mj_rgba,
+            specular=mj_specular,
+            glossiness=mj_glossiness,
+        )
+    else:
+        mj_rgba = np.asarray(mj_geom.rgba, dtype=np.float32)
+        mj_mat = None
+        tmesh_mat = trimesh.visual.material.SimpleMaterial(diffuse=mj_rgba)
+
     if mj_geom.type == mujoco.mjtGeom.mjGEOM_PLANE:
         length, width, _ = geom_size
         length = length or 1e3
         width = width or 1e3
 
-        tmesh = trimesh.Trimesh(
+        uv = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32)
+        mesh_params = dict(
             vertices=np.array(
-                [[-length, width, 0.0], [length, width, 0.0], [-length, -width, 0.0], [length, -width, 0.0]]
+                [[-length, width, 0.0], [length, width, 0.0], [-length, -width, 0.0], [length, -width, 0.0]],
+                dtype=np.float32,
             ),
-            faces=np.array([[0, 2, 3], [0, 3, 1]]),
-            face_normals=np.array(
-                [
-                    [0, 0, 1],
-                    [0, 0, 1],
-                ]
-            ),
+            faces=np.array([[0, 2, 3], [0, 3, 1]], dtype=np.int64),
+            face_normals=np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=np.float32),
         )
-        geom_data = np.array([0.0, 0.0, 1.0])
+        geom_data = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         gs_type = gs.GEOM_TYPE.PLANE
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_SPHERE:
@@ -438,6 +469,8 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
             tmesh = trimesh.creation.icosphere(radius=radius, subdivisions=2)
         else:
             tmesh = trimesh.creation.icosphere(radius=radius)
+        mesh_params = dict(vertices=tmesh.vertices, faces=tmesh.faces)
+        uv = None
         gs_type = gs.GEOM_TYPE.SPHERE
         geom_data = np.array([radius * scale])
 
@@ -446,7 +479,9 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
             tmesh = trimesh.creation.icosphere(radius=1.0, subdivisions=2)
         else:
             tmesh = trimesh.creation.icosphere(radius=1.0)
+        mesh_params = dict(vertices=tmesh.vertices, faces=tmesh.faces)
         tmesh.apply_transform(np.diag([*geom_size, 1]))
+        uv = None
         gs_type = gs.GEOM_TYPE.ELLIPSOID
         geom_data = geom_size * scale
 
@@ -457,6 +492,8 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
             tmesh = trimesh.creation.capsule(radius=radius, height=height, count=(8, 12))
         else:
             tmesh = trimesh.creation.capsule(radius=radius, height=height)
+        mesh_params = dict(vertices=tmesh.vertices, faces=tmesh.faces)
+        uv = None
         gs_type = gs.GEOM_TYPE.CAPSULE
         geom_data = np.array([radius * scale, height * scale])
 
@@ -464,79 +501,52 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
         radius = geom_size[0]
         height = geom_size[1] * 2
         tmesh = trimesh.creation.cylinder(radius=radius, height=height)
+        mesh_params = dict(vertices=tmesh.vertices, faces=tmesh.faces)
+        uv = None
         gs_type = gs.GEOM_TYPE.CYLINDER
         geom_data = np.array([radius * scale, height * scale])
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_BOX:
         tmesh = trimesh.creation.box(extents=geom_size * 2)
+        mesh_params = dict(vertices=tmesh.vertices, faces=tmesh.faces)
+        uv = tmesh.vertices[:, :2].copy()
+        uv -= uv.min(axis=0)
+        uv /= uv.max(axis=0)
         gs_type = gs.GEOM_TYPE.BOX
-        if mj_geom.matid >= 0:
-            mj_mat = mj.mat(mj_geom.matid[0])
-            tex_id_RGB = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGB]
-            tex_id_RGBA = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGBA]
-            tex_id = tex_id_RGB if tex_id_RGB >= 0 else tex_id_RGBA
-            if tex_id >= 0:
-                mj_tex = mj.tex(tex_id)
-                # assert mj_tex.type == mujoco.mjtTexture.mjTEXTURE_2D
-                uv_coordinates = tmesh.vertices[:, :2].copy()
-                uv_coordinates -= uv_coordinates.min(axis=0)
-                uv_coordinates /= uv_coordinates.max(axis=0)
-                H, W, C = mj_tex.height[0], mj_tex.width[0], mj_tex.nchannel[0]
-                image_array = mj.tex_data[mj_tex.adr[0] : (mj_tex.adr[0] + H * W * C)].reshape(H, W, C)
-                uv_coordinates = uv_coordinates * mj_mat.texrepeat
-                visual = TextureVisuals(uv=uv_coordinates, image=Image.fromarray(image_array))
-                tmesh.visual = visual
         geom_data = 2 * geom_size * scale
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_MESH:
         mj_mesh = mj.mesh(mj_geom.dataid[0])
 
         vert_start = mj_mesh.vertadr[0]
-        vert_num = mj_mesh.vertnum[0]
-        vert_end = vert_start + vert_num
+        vert_end = vert_start + mj_mesh.vertnum[0]
 
         face_start = mj_mesh.faceadr[0]
-        face_num = mj_mesh.facenum[0]
-        face_end = face_start + face_num
+        face_end = face_start + mj_mesh.facenum[0]
 
         vertices = mj.mesh_vert[vert_start:vert_end]
+        normals = mj.mesh_normal[vert_start:vert_end]
         faces = mj.mesh_face[face_start:face_end]
-        face_normals = mj.mesh_normal[vert_start:vert_end]
-        visual = None
 
-        if mj_geom.matid >= 0:
-            mj_mat = mj.mat(mj_geom.matid[0])
-            tex_id_RGB = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGB]
-            tex_id_RGBA = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGBA]
-            tex_id = tex_id_RGB if tex_id_RGB >= 0 else tex_id_RGBA
-            if tex_id >= 0:
-                mj_tex = mj.tex(tex_id)
-                tex_vert_start = int(mj.mesh_texcoordadr[mj_mesh.id])
-                num_tex_vert = int(mj.mesh_texcoordnum[mj_mesh.id])
-                if tex_vert_start != -1:  # -1 means no texcoord
-                    vertices = np.zeros((num_tex_vert, 3))
-                    faces = mj.mesh_facetexcoord[face_start:face_end]
-                    for face_id in range(face_start, face_end):
-                        for i in range(3):
-                            mesh_vert_id = mj.mesh_face[face_id, i]
-                            tex_vert_id = mj.mesh_facetexcoord[face_id, i]
-                            vertices[tex_vert_id] = mj.mesh_vert[mesh_vert_id + vert_start]
+        tex_vert_start = int(mj.mesh_texcoordadr[mj_mesh.id])
+        tex_vert_end = tex_vert_start + int(mj.mesh_texcoordnum[mj_mesh.id])
 
-                    uv = mj.mesh_texcoord[tex_vert_start : (tex_vert_start + num_tex_vert)]
-                    uv[:, 1] = 1 - uv[:, 1]
+        if tex_vert_start != -1:  # -1 means no texcoord
+            tex_faces = mj.mesh_facetexcoord[face_start:face_end]
+            uv = mj.mesh_texcoord[tex_vert_start:tex_vert_end]
+            uv[:, 1] = 1 - uv[:, 1]
 
-                    H, W, C = mj_tex.height[0], mj_tex.width[0], mj_tex.nchannel[0]
-                    image_array = mj.tex_data[mj_tex.adr[0] : (mj_tex.adr[0] + H * W * C)].reshape(H, W, C)
-                    uv = uv * mj_mat.texrepeat
-                    visual = TextureVisuals(uv=uv, image=Image.fromarray(image_array))
+            pairs = np.stack([faces.ravel(), tex_faces.ravel()], axis=1)  # (face_num * 3, 2)
+            uniq, inv = np.unique(pairs, axis=0, return_inverse=True)
 
-        tmesh = trimesh.Trimesh(
-            vertices=vertices,
-            faces=faces,
-            face_normals=face_normals,
-            process=False,
-            visual=visual,
-        )
+            vertices = vertices[uniq[:, 0]]
+            normals = normals[uniq[:, 0]]
+            uv = uv[uniq[:, 1]]
+            faces = inv.reshape(-1, 3).astype(np.int64)
+        else:
+            uv = None
+
+        mesh_params = dict(vertices=vertices, faces=faces, vertex_normals=normals)
         gs_type = gs.GEOM_TYPE.MESH
         geom_data = None
 
@@ -546,15 +556,16 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
         gs.logger.warning(f"Unsupported MJCF geom type '{mj_geom.type}'.")
         return None
 
+    if uv is not None and mj_mat is not None:
+        uv *= mj_mat.texrepeat
+    tmesh = trimesh.Trimesh(
+        **mesh_params,
+        visual=TextureVisuals(uv=uv, material=tmesh_mat),
+        process=False,
+    )
     mesh = gs.Mesh.from_trimesh(
         tmesh, scale=scale, surface=gs.surfaces.Collision() if is_col else surface, metadata=metadata
     )
-
-    if surface.diffuse_texture is None and visual is None:  # user input will override mjcf color
-        if mj_geom.matid >= 0:
-            mesh.set_color(mj.mat(mj_geom.matid[0]).rgba)
-        else:
-            mesh.set_color(mj_geom.rgba)
 
     info = {
         "type": gs_type,

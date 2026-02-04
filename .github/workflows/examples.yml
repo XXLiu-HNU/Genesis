@@ -27,6 +27,7 @@ jobs:
       TI_ENABLE_OPENGL: "0"
       TI_ENABLE_VULKAN: "0"
       TI_DEBUG: "0"
+      OMNI_KIT_ACCEPT_EULA: "yes"
 
     steps:
       - name: Checkout code
@@ -41,6 +42,8 @@ jobs:
 
       - name: Install Mesa OpenGL driver for headless rendering
         run: |
+          # fix broken microsoft package source on ubuntu-24.04
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list
           sudo apt-get update
           sudo apt install -y \
               libglu1-mesa \
@@ -49,9 +52,9 @@ jobs:
 
       - name: Install Python deps
         run: |
-          pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip setuptools wheel
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e '.[dev]' pynput
+          pip install -e '.[dev,usd]' pynput
 
       - name: Get gstaichi version
         id: gstaichi_version
