@@ -1119,17 +1119,30 @@ def test_filter_neutral_self_collisions(show_viewer):
         rigid_options=gs.options.RigidOptions(
             enable_self_collision=True,
             enable_neutral_collision=False,
+            enable_adjacent_collision=False,
         ),
         show_viewer=show_viewer,
     )
     robot = scene.add_entity(
         gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"),
     )
+    sphere = scene.add_entity(
+        gs.morphs.Sphere(
+            radius=0.08,
+        ),
+        surface=gs.surfaces.Default(
+            color=(0.0, 2.0, 0.0, 1.0),
+        ),
+    )
     box = scene.add_entity(
         gs.morphs.Box(
             size=(0.1, 0.1, 0.1),
         ),
+        surface=gs.surfaces.Default(
+            color=(1.0, 0.0, 0.0, 1.0),
+        ),
     )
+    sphere.attach(robot, "hand")
     scene.build()
     eq_type = scene.rigid_solver.equalities_info.eq_type.to_numpy()[: scene.rigid_solver.n_equalities, 0]
     eq_obj1id = scene.rigid_solver.equalities_info.eq_obj1id.to_numpy()[: scene.rigid_solver.n_equalities, 0]
@@ -1137,19 +1150,22 @@ def test_filter_neutral_self_collisions(show_viewer):
 
     scene.rigid_solver.collider.detection()
     contacts_data = scene.rigid_solver.collider.get_contacts()
-    assert ((contacts_data["link_a"] == 11) & (contacts_data["link_b"] == 0)).any()
+    assert ((contacts_data["link_a"] == 12) & (contacts_data["link_b"] == 0)).any()
 
     for i in range(2):
-        for i_ga in range(robot.n_geoms):
-            for i_gb in range(i_ga + 1, robot.n_geoms):
+        for i_ga in range(robot.geom_start, box.geom_start):
+            for i_gb in range(i_ga + 1, box.geom_start):
                 geom_a = scene.rigid_solver.geoms[i_ga]
                 geom_b = scene.rigid_solver.geoms[i_gb]
                 link_a = geom_a.link
                 link_b = geom_b.link
+
                 if link_a.idx == link_b.idx:
                     continue
+
                 if link_a.is_fixed and link_b.is_fixed:
                     continue
+
                 if (
                     (eq_type == gs.EQUALITY_TYPE.WELD)
                     & (
@@ -1158,8 +1174,19 @@ def test_filter_neutral_self_collisions(show_viewer):
                     )
                 ).any():
                     continue
-                if link_a.idx == link_b.parent_idx:
+
+                is_adjacent = False
+                link = link_b
+                while link.parent_idx > 0:
+                    if link.parent_idx == link_a.idx:
+                        is_adjacent = True
+                        break
+                    if not all(joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints):
+                        break
+                    link = scene.rigid_solver.links[link.parent_idx]
+                if is_adjacent:
                     continue
+
                 verts_a = tensor_to_array(geom_a.get_verts())
                 verts_a = (1.0 - 1e-3) * verts_a + 1e-3 * verts_a.mean(axis=0, keepdims=True)
                 mesh_a = trimesh.Trimesh(vertices=verts_a, faces=geom_a.init_faces, process=False)
@@ -1168,7 +1195,7 @@ def test_filter_neutral_self_collisions(show_viewer):
                 verts_b = (1.0 - 1e-3) * verts_b + 1e-3 * verts_b.mean(axis=0, keepdims=True)
                 mesh_b = trimesh.Trimesh(vertices=verts_b, faces=geom_b.init_faces, process=False)
                 is_colliding = mesh_a.contains(mesh_b.vertices).any() or mesh_b.contains(mesh_a.vertices).any()
-                assert is_colliding == ({(i_ga, i_gb)} in ({(5, 10)}, {(6, 10)}))
+                assert is_colliding == ({(i_ga, i_gb)} in ({(5, 10)}, {(6, 10)}, {(11, 23)}, {(17, 23)}))
         scene.step()
 
 
@@ -2044,7 +2071,6 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
         gs.morphs.Mesh(
             file=f"{asset_path}/work_table.glb",
             pos=(0.4, 0.0, -0.54),
-            quat=(0.707, -0.707, 0, 0),
             fixed=True,
         ),
         vis_mode="collision",
@@ -2685,11 +2711,12 @@ def test_urdf_capsule(tmp_path, show_viewer, tol):
 @pytest.mark.required
 @pytest.mark.required
 @pytest.mark.parametrize("overwrite", [False, True])
-def test_urdf_color_overwrite(overwrite):
-    scene = gs.Scene()
+def test_urdf_color_overwrite(overwrite, show_viewer):
+    scene = gs.Scene(show_viewer=show_viewer)
     box = scene.add_entity(
         gs.morphs.URDF(
             file="genesis/assets/urdf/blue_box/model.urdf",
+            convexify=False,
         ),
         surface=gs.surfaces.Default(
             color=(1.0, 0.0, 0.0, 1.0) if overwrite else None,
@@ -2698,17 +2725,32 @@ def test_urdf_color_overwrite(overwrite):
     axis = scene.add_entity(
         gs.morphs.Mesh(
             file="meshes/axis.obj",
+            convexify=False,
         ),
         surface=gs.surfaces.Default(
             color=(1.0, 0.0, 0.0, 1.0) if overwrite else None,
         ),
     )
+    asset_path = get_hf_dataset(pattern="work_table.glb")
+    table = scene.add_entity(
+        gs.morphs.Mesh(
+            file=f"{asset_path}/work_table.glb",
+            convexify=False,
+        ),
+        surface=gs.surfaces.Default(
+            color=(1.0, 0.0, 0.0, 1.0) if overwrite else None,
+        ),
+    )
+    if show_viewer:
+        scene.build()
     for vgeom in box.vgeoms:
+        assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite
         visual = vgeom.vmesh.trimesh.visual
         assert visual.defined
         color = np.unique(visual.vertex_colors, axis=0)
         assert_array_equal(color, (255, 0, 0, 255) if overwrite else (0, 0, 255, 255))
     for vgeom in axis.vgeoms:
+        assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite
         visual = vgeom.vmesh.trimesh.visual
         assert visual.defined
         color = np.unique(visual.vertex_colors, axis=0)
@@ -2716,8 +2758,16 @@ def test_urdf_color_overwrite(overwrite):
             assert_array_equal(color, (255, 0, 0, 255))
         else:
             assert_array_equal(color, [[0, 0, 178, 255], [0, 178, 0, 255], [178, 0, 0, 255], [255, 255, 255, 255]])
+    for vgeom in table.vgeoms:
+        assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite
+        visual = vgeom.vmesh.trimesh.visual
+        assert visual.defined
+        if overwrite:
+            color = np.unique(visual.vertex_colors, axis=0)
+            assert_array_equal(color, (255, 0, 0, 255))
     for entity in scene.entities:
         for geom in entity.geoms:
+            assert geom.mesh.metadata["is_visual_overwritten"]
             visual = geom.mesh.trimesh.visual
             assert visual.defined
             color = np.unique(visual.vertex_colors, axis=0)
@@ -3885,6 +3935,11 @@ def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol, monkeypat
         sim_options=gs.options.SimOptions(
             dt=0.01,
         ),
+        rigid_options=gs.options.RigidOptions(
+            enable_self_collision=True,
+            enable_neutral_collision=True,
+            enable_adjacent_collision=False,
+        ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0, -3.5, 2.5),
             camera_lookat=(0.0, 0.0, 0.5),
@@ -3930,6 +3985,15 @@ def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol, monkeypat
     scene.build()
     with pytest.raises(gs.GenesisException):
         box.attach(hand, "right_finger")
+
+    # Make sure that collision between hand base link and franka attachment point has been filtered out as adjacent
+    collision_pair_idx = scene.rigid_solver.collider._collider_info.collision_pair_idx.to_numpy()
+    assert collision_pair_idx[franka.get_link("attachment").idx, hand.base_link_idx] == -1
+
+    with pytest.raises(gs.GenesisException):
+        hand.set_pos(0.0)
+    with pytest.raises(gs.GenesisException):
+        hand.set_quat(0.0)
 
     franka.control_dofs_position([-1, 0.8, 1, -2, 1, 0.5, -0.5])
     hand.control_dofs_position([0.04, 0.04])
@@ -4223,3 +4287,82 @@ def test_pick_heterogenous_objects(show_viewer):
     post_lift_z = het_obj.get_pos()[:, 2]
     lift_deltas = (post_lift_z - pre_lift_z).cpu().numpy()
     assert np.all(lift_deltas > 0.05), f"All objects should be lifted (deltas={lift_deltas:.3f})"
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("performance_mode", [True])
+def test_hibernation_and_contact_islands(show_viewer):
+    """
+    Test hibernation and contact island behavior.
+
+    Scenario:
+    1. Two boxes settle separately on ground -> both hibernate, 2 contact islands
+    2. Move one box above the other using set_pos (wakes it up)
+    3. Box falls and collides -> both boxes awake
+    4. Stacked boxes settle and hibernate -> 1 contact island (merged)
+    """
+    if gs.use_ndarray:
+        pytest.skip("Hibernation does not support dynamic array mode.")
+
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            use_contact_island=True,
+            use_hibernation=True,
+        ),
+        show_viewer=show_viewer,
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+
+    # Two boxes placed separately on ground
+    box1 = scene.add_entity(
+        gs.morphs.Box(pos=(-0.3, 0, 0.15), size=(0.1, 0.1, 0.1)),
+    )
+    box2 = scene.add_entity(
+        gs.morphs.Box(pos=(0.3, 0, 0.15), size=(0.1, 0.1, 0.1)),
+    )
+
+    scene.build()
+
+    solver = scene.sim.rigid_solver
+    box1_idx = box1._idx_in_solver
+    box2_idx = box2._idx_in_solver
+
+    # Phase 1: Let boxes settle and hibernate separately
+    for step in range(200):
+        scene.step()
+        if solver.entities_state.hibernated[box1_idx, 0] and solver.entities_state.hibernated[box2_idx, 0]:
+            break
+
+    assert solver.entities_state.hibernated[box1_idx, 0]
+    assert solver.entities_state.hibernated[box2_idx, 0]
+    assert solver.constraint_solver.contact_island.n_islands[0] == 2
+
+    # Phase 2: Move box1 above box2 (this should wake up box1)
+    offset = 0.01
+    box2_pos = box2.get_pos()
+    box1.set_pos(np.array([float(box2_pos[0]) + offset, float(box2_pos[1]) + offset, 0.3]))
+
+    # Verify box1 woke up and position was set
+    assert not solver.entities_state.hibernated[box1_idx, 0]
+    assert float(box1.get_pos()[2]) > 0.2
+
+    # Let box1 fall and collide with box2
+    for _ in range(25):
+        scene.step()
+
+    # Both boxes should be awake shortly after collision (before they re-hibernate)
+    assert not solver.entities_state.hibernated[box1_idx, 0]
+    assert not solver.entities_state.hibernated[box2_idx, 0]
+
+    # Phase 3: Let stacked boxes settle and hibernate
+    for step in range(200):
+        scene.step()
+        if solver.entities_state.hibernated[box1_idx, 0] and solver.entities_state.hibernated[box2_idx, 0]:
+            break
+
+    assert solver.entities_state.hibernated[box1_idx, 0]
+    assert solver.entities_state.hibernated[box2_idx, 0]
+
+    # Stacked boxes should form 1 contact island
+    assert solver.constraint_solver.contact_island.n_islands[0] == 1

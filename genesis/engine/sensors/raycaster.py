@@ -219,7 +219,7 @@ def kernel_cast_rays(
                 if node.left == -1:  # is leaf node
                     # A leaf node corresponds to one of the sorted triangles. Find the original triangle index.
                     sorted_leaf_idx = node_idx - (n_triangles - 1)
-                    i_f = ti.cast(bvh_morton_codes[0, sorted_leaf_idx][1], ti.i32)
+                    i_f = ti.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], ti.i32)
 
                     tri_vertices = ti.Matrix.zero(gs.ti_float, 3, 3)
                     for i in ti.static(range(3)):
@@ -293,7 +293,7 @@ class RaycasterSharedMetadata(RigidSensorMetadataMixin, SharedSensorMetadata):
     min_ranges: torch.Tensor = make_tensor_field((0,))
     max_ranges: torch.Tensor = make_tensor_field((0,))
     no_hit_values: torch.Tensor = make_tensor_field((0,))
-    return_world_frame: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_bool)
+    return_world_frame: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_bool)
 
     patterns: list[RaycastPattern] = field(default_factory=list)
     ray_dirs: torch.Tensor = make_tensor_field((0, 3))
@@ -301,10 +301,10 @@ class RaycasterSharedMetadata(RigidSensorMetadataMixin, SharedSensorMetadata):
     ray_starts_world: torch.Tensor = make_tensor_field((0, 3))
     ray_dirs_world: torch.Tensor = make_tensor_field((0, 3))
 
-    points_to_sensor_idx: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
-    sensor_cache_offsets: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
-    sensor_point_offsets: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
-    sensor_point_counts: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
+    points_to_sensor_idx: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
+    sensor_cache_offsets: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
+    sensor_point_offsets: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
+    sensor_point_counts: torch.Tensor = make_tensor_field((0,), dtype=gs.tc_int)
 
 
 class RaycasterData(NamedTuple):
@@ -329,7 +329,7 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
     @classmethod
     def _update_bvh(cls, shared_metadata: RaycasterSharedMetadata):
         """Rebuild BVH from current geometry in the scene."""
-        from genesis.engine.solvers.rigid.rigid_solver_decomp import kernel_update_all_verts
+        from genesis.engine.solvers.rigid.rigid_solver import kernel_update_all_verts
 
         kernel_update_all_verts(
             geoms_info=shared_metadata.solver.geoms_info,
@@ -385,7 +385,7 @@ class RaycasterSensor(RigidSensorMixin, Sensor):
 
         # These fields are used to properly index into the big cache tensor in kernel_cast_rays
         self._shared_metadata.sensor_cache_offsets = concat_with_tensor(
-            self._shared_metadata.sensor_cache_offsets, self._cache_size
+            self._shared_metadata.sensor_cache_offsets, self._cache_size * (self._idx + 1)
         )
         self._shared_metadata.sensor_point_offsets = concat_with_tensor(
             self._shared_metadata.sensor_point_offsets, self._shared_metadata.total_n_rays
