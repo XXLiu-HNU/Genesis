@@ -58,6 +58,8 @@ class Mesh(RBC):
         self._uid = gs.UID()
         self._mesh = mesh  # .copy() FIXME: For some reason forcing copy is causing some tests to fails...
         self._surface = surface
+        if uvs is not None:
+            uvs = uvs.astype(gs.np_float, copy=False)
         self._uvs = uvs
         self._metadata: dict[str, Any] = metadata or {}
         self._color = np.array([1.0, 1.0, 1.0, 1.0], dtype=gs.np_float)
@@ -93,7 +95,7 @@ class Mesh(RBC):
             self.convexify()
 
         if decimate:
-            self.decimate(decimate_face_num, decimate_aggressiveness, convexify)
+            self.decimate(decimate_face_num, decimate_aggressiveness)
 
     def convexify(self):
         """
@@ -104,7 +106,7 @@ class Mesh(RBC):
             self._metadata["convexified"] = True
         self.clear_visuals()
 
-    def decimate(self, decimate_face_num, decimate_aggressiveness, convexify):
+    def decimate(self, decimate_face_num, decimate_aggressiveness):
         """
         Decimate the mesh.
         """
@@ -120,10 +122,6 @@ class Mesh(RBC):
                 ),
             )
             self._metadata["decimated"] = True
-
-            # need to run convexify again after decimation, because sometimes decimating a convex-mesh can make it non-convex...
-            if convexify:
-                self.convexify()
 
         self.clear_visuals()
 
@@ -241,12 +239,13 @@ class Mesh(RBC):
 
         mesh = mesh.copy(**(dict(include_cache=True) if isinstance(mesh, trimesh.Trimesh) else {}))
 
-        try:  # always parse uvs because roughness and normal map also need uvs
+        # Always parse uvs if available because roughness and normal map also need uvs.
+        # Note that some visual may not have uv, e.g. ColorVisuals.
+        uvs = None
+        if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals) and mesh.visual.uv is not None:
+            # Note that 'trimesh' uses uvs starting from top left corner.
             uvs = mesh.visual.uv.copy()
-            uvs[:, 1] = 1.0 - uvs[:, 1]  # trimesh uses uvs starting from top left corner
-        except AttributeError:
-            # Visual may not have uv, e.g. ColorVisuals
-            uvs = None
+            uvs[:, 1] = 1.0 - uvs[:, 1]
 
         metadata = metadata or {}
         must_update_surface = True
@@ -439,7 +438,7 @@ class Mesh(RBC):
         """
         Whether the mesh is convex.
         """
-        return self._mesh.is_convex
+        return self.metadata.get("convexified", self._mesh.is_convex)
 
     @property
     def metadata(self):

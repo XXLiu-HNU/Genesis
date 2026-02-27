@@ -187,69 +187,155 @@ class IPCCouplerOptions(BaseCouplerOptions):
     """
     Options configuring the Incremental Potential Contact (IPC) coupler.
 
+    Time step, gravity, and differentiable simulation mode are derived from ``SimOptions``
+    (``dt``, ``gravity``, ``requires_grad``) and should not be set here.
+
     Parameters
     ----------
-    dt : float, optional
-        Time step for IPC simulation. Defaults to 0.001.
-    gravity : tuple, optional
-        Gravity vector for IPC simulation. Defaults to (0.0, 0.0, -9.8).
+    Newton Solver Options
+    ---------------------
+    newton_max_iterations : int, optional
+        Maximum iterations for Newton solver. Defaults to None (use libuipc default: 1024).
+    newton_min_iterations : int, optional
+        Minimum iterations for Newton solver. Defaults to None (use libuipc default: 1).
+    newton_tolerance : float, optional
+        Velocity tolerance for Newton solver convergence. Defaults to None (use libuipc default: 0.05).
+    newton_ccd_tolerance : float, optional
+        CCD (Continuous Collision Detection) tolerance for Newton solver. Defaults to None (use libuipc default: 1.0).
+    newton_use_adaptive_tolerance : bool, optional
+        Whether Newton solver should use adaptive tolerance. Defaults to None (use libuipc default: False).
+    newton_translation_tolerance : float, optional
+        Translation rate tolerance for Newton solver. Defaults to None (use libuipc default: 0.1).
+    newton_semi_implicit_enable : bool, optional
+        Whether to enable semi-implicit Newton solver mode. Defaults to None (use libuipc default: False).
+    newton_semi_implicit_beta_tolerance : float, optional
+        Beta tolerance for semi-implicit Newton solver. Defaults to None (use libuipc default: 1e-3).
+
+    Line Search Options
+    -------------------
+    n_linesearch_iterations : int, optional
+        Maximum iterations for line search. Defaults to None (use libuipc default: 8).
+    linesearch_report_energy : bool, optional
+        Whether to report energy during line search. Defaults to None (use libuipc default: False).
+
+    Linear System Options
+    ---------------------
+    linear_system_solver : str, optional
+        Linear system solver type. Options: 'linear_pcg', 'direct', etc. Defaults to None (use libuipc default: 'linear_pcg').
+    linear_system_tolerance : float, optional
+        Tolerance for linear system solver. Defaults to None (use libuipc default: 1e-3).
+
+    Contact Options
+    ---------------
+    contact_enable : bool, optional
+        Whether to enable contact detection. Defaults to None (use libuipc default: True).
     contact_d_hat : float, optional
-        Contact distance threshold. Defaults to 0.001.
+        Contact distance threshold. Defaults to None (use libuipc default: 0.01).
     contact_friction_enable : bool, optional
-        Whether to enable friction in contact. Defaults to True.
+        Whether to enable friction in contact. Defaults to None (use libuipc default: True).
     contact_friction_mu : float, optional
-        Friction coefficient. Defaults to 0.5.
+        Friction coefficient of the ground/floor surface. Combined with per-entity material friction
+        (``coup_friction`` for Rigid, ``friction_mu`` for FEM/Cloth) via geometric mean for all contact
+        pairs involving the ground. Defaults to 0.5.
     contact_resistance : float, optional
-        Contact resistance/stiffness. Defaults to 1e9.
-    newton_velocity_tol : float, optional
-        Velocity tolerance for Newton solver. Defaults to 0.001.
-    line_search_max_iter : int, optional
-        Maximum iterations for line search. Defaults to 30.
-    linear_system_tol_rate : float, optional
-        Tolerance rate for linear system solver. Defaults to 1e-4.
+        Ground/default contact resistance/stiffness. It is used for ground contact pairs and
+        as the per-entity fallback when a material does not define ``contact_resistance``.
+        For ground pairs, it is combined with entity ``material.contact_resistance`` via
+        geometric mean. Defaults to 1e9.
+    contact_eps_velocity : float, optional
+        Epsilon velocity for contact. Defaults to None (use libuipc default: 0.01).
+    contact_constitution : str, optional
+        Contact constitution model. Options: 'ipc', 'isometric'. Defaults to None (use libuipc default: 'ipc').
+
+    Collision Detection Options
+    ---------------------------
+    collision_detection_method : str, optional
+        Collision detection method. Options: 'linear_bvh', 'spatial_hash', etc. Defaults to None (use libuipc default: 'linear_bvh').
+
+    CFL Options
+    -----------
+    cfl_enable : bool, optional
+        Whether to enable CFL (Courant-Friedrichs-Lewy) condition. Defaults to None (use libuipc default: False).
+
+    Sanity Check Options
+    --------------------
     sanity_check_enable : bool, optional
-        Whether to enable sanity checks. Defaults to False.
-    ipc_constraint_strength : tuple, optional
-        Strength ratios for IPC soft transform constraint coupling. Tuple of (translation_strength, rotation_strength).
-        Higher values create stiffer coupling between Genesis rigid bodies and IPC ABD objects. Defaults to (100.0, 100.0).
+        Whether to enable sanity checks. Defaults to None (use libuipc default: True).
+
+    Genesis Coupling Options
+    ------------------------
+    constraint_strength_translation : float, optional
+        Translation strength for IPC soft transform constraint coupling.
+        Higher values create stiffer position coupling between Genesis rigid bodies and IPC ABD objects.
+        Defaults to 100.0.
+    constraint_strength_rotation : float, optional
+        Rotation strength for IPC soft transform constraint coupling.
+        Higher values create stiffer orientation coupling between Genesis rigid bodies and IPC ABD objects.
+        Defaults to 100.0.
+    enable_rigid_ground_contact : bool, optional
+        Whether to enable ground contact in IPC system. When False, objects in IPC will not collide
+        with the ground plane. Defaults to True.
+    enable_rigid_rigid_contact : bool, optional
+        Whether to enable contact detection between rigid bodies (ABD objects) in the IPC system.
+        When False, only soft-soft and soft-rigid collisions are detected by IPC; rigid-rigid
+        collisions within IPC are skipped. Defaults to True.
     two_way_coupling : bool, optional
-        Whether to enable bidirectional coupling between IPC and Genesis rigid bodies.
-        When True, forces from IPC ABD constraint are applied back to Genesis rigid bodies.
-        When False, only Genesis → IPC coupling is active (one-way). Defaults to True.
-    IPC_self_contact : bool, optional
-        Whether to enable contact detection between rigid bodies in IPC system (ABD-ABD collisions).
-        When False, only FEM-FEM and FEM-ABD collisions are detected. Defaults to False.
-    disable_genesis_ground_contact : bool, optional
-        Whether to disable ground contact in Genesis rigid solver when using IPC.
-        When True, ground collision is only handled by IPC system, not by Genesis rigid solver.
-        This can be useful to avoid double-counting ground contacts. Defaults to False.
-    disable_ipc_ground_contact : bool, optional
-        Whether to disable ground contact in IPC system.
-        When True, all objects in IPC (FEM, cloth, rigid ABD) will not collide with ground plane.
-        Defaults to False.
-    disable_ipc_logging : bool, optional
-        Whether to disable IPC library logging output. Defaults to True.
-    enable_ipc_gui : bool, optional
-        Whether to enable IPC GUI visualization using polyscope. Defaults to False.
+        Whether to apply coupling forces/torques from IPC back to Genesis rigid bodies. Defaults to True.
+    enable_rigid_dofs_sync : bool, optional
+        Whether to synchronize the IPC reference DOF state with Genesis each step for
+        external_articulation entities. When True, IPC gets tighter coupling with Genesis joint
+        state but may amplify small divergences. When False, IPC uses its own DOF reference
+        without per-step updates. Defaults to False.
+    free_base_driven_by_ipc : bool, optional
+        For external_articulation with non-fixed base: whether base link is fully driven by IPC physics.
+        When False, base link uses SoftTransformConstraint controlled by Genesis. When True, base link
+        is fully driven by IPC physics. Defaults to False.
     """
 
-    dt: float = 0.001
-    gravity: tuple = (0.0, 0.0, -9.8)
-    contact_d_hat: float = 0.001
-    contact_friction_enable: bool = True
+    # Newton solver options (None = use libuipc default)
+    newton_max_iterations: int = None
+    newton_min_iterations: int = None
+    newton_tolerance: float = None
+    newton_ccd_tolerance: float = None
+    newton_use_adaptive_tolerance: bool = None
+    newton_translation_tolerance: float = None
+    newton_semi_implicit_enable: bool = None
+    newton_semi_implicit_beta_tolerance: float = None
+
+    # Line search options (None = use libuipc default)
+    n_linesearch_iterations: int = None
+    linesearch_report_energy: bool = None
+
+    # Linear system options (None = use libuipc default)
+    linear_system_solver: str = None
+    linear_system_tolerance: float = None
+
+    # Contact options
+    contact_enable: bool = None
+    contact_d_hat: float = None
+    contact_friction_enable: bool = None
     contact_friction_mu: float = 0.5
     contact_resistance: float = 1e9
-    newton_velocity_tol: float = 0.001
-    line_search_max_iter: int = 30
-    linear_system_tol_rate: float = 1e-4
-    sanity_check_enable: bool = False
-    ipc_constraint_strength: tuple = (100.0, 100.0)
+    contact_eps_velocity: float = None
+    contact_constitution: str = None
+
+    # Collision detection options
+    collision_detection_method: str = None
+
+    # CFL options
+    cfl_enable: bool = None
+
+    # Sanity check options
+    sanity_check_enable: bool = None
+
+    # Genesis coupling options
+    constraint_strength_translation: float = 100.0
+    constraint_strength_rotation: float = 100.0
+    enable_rigid_ground_contact: bool = True
+    enable_rigid_rigid_contact: bool = True
     two_way_coupling: bool = True
-    IPC_self_contact: bool = False
-    disable_genesis_ground_contact: bool = False
-    disable_ipc_ground_contact: bool = False
-    disable_ipc_logging: bool = True
-    enable_ipc_gui: bool = False
+    enable_rigid_dofs_sync: bool = False
+    free_base_driven_by_ipc: bool = False
 
 
 ############################ Solvers inside simulator ############################

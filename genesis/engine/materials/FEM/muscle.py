@@ -1,8 +1,8 @@
-import gstaichi as ti
+import quadrants as qd
 from .elastic import Elastic
 
 
-@ti.data_oriented
+@qd.data_oriented
 class Muscle(Elastic):
     """
     The muscle material class for FEM.
@@ -22,6 +22,11 @@ class Muscle(Elastic):
         Default is 'linear'.
     n_groups: int, optional
         Number of muscle groups. Default is 1.
+    friction_mu: float, optional
+        Contact friction coefficient for IPC/SAP coupling. Default is 0.1.
+    contact_resistance: float | None, optional
+        IPC contact resistance/stiffness override. ``None`` uses the coupler global
+        default. Default is None.
     """
 
     def __init__(
@@ -31,8 +36,17 @@ class Muscle(Elastic):
         rho=1000.0,  # density (kg/m^3)
         model="linear",
         n_groups=1,  # number of muscle group
+        friction_mu=0.1,
+        contact_resistance=None,
     ):
-        super().__init__(E, nu, rho, model)
+        super().__init__(
+            E=E,
+            nu=nu,
+            rho=rho,
+            friction_mu=friction_mu,
+            contact_resistance=contact_resistance,
+            model=model,
+        )
 
         # inherit from Elastic
         self._update_stress_without_actuation = self.update_stress
@@ -41,7 +55,7 @@ class Muscle(Elastic):
         self._stiffness = E  # NOTE: use Young's modulus as muscle stiffness
         self._n_groups = n_groups
 
-    @ti.func
+    @qd.func
     def _update_stress_with_actuation(self, mu, lam, J, F, actu, m_dir):
         stress = self._update_stress_without_actuation(mu, lam, J, F, actu, m_dir)
 
